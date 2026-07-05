@@ -51,6 +51,26 @@ def initialise_database(db_path=DB_PATH):
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scanner_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_time TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            status TEXT NOT NULL,
+            signal TEXT NOT NULL,
+            price REAL,
+            rsi REAL,
+            atr REAL,
+            trend TEXT,
+            momentum TEXT,
+            volume TEXT,
+            suggested_shares INTEGER,
+            stop_loss REAL,
+            take_profit REAL,
+            dollar_risk REAL
+        )
+    """)
+
     conn.commit()
     conn.close()
 

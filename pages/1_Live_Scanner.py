@@ -8,6 +8,11 @@ from core.risk.risk_engine import (
     calculate_position_size,
     calculate_take_profit
 )
+from core.scanner.scanner_repository import (
+    get_recent_buy_signals,
+    get_recent_scanner_results,
+    save_scanner_results
+)
 from core.strategy.trend_momentum_strategy import generate_signals
 
 st.set_page_config(page_title="Live Scanner", layout="wide")
@@ -15,8 +20,8 @@ st.set_page_config(page_title="Live Scanner", layout="wide")
 st.title("Live Scanner")
 
 st.write(
-    "Scan symbols using the core trading engine: market data, strategy, "
-    "risk engine, and signal filters."
+    "Scan symbols using the core trading engine. Results are displayed "
+    "and saved into SQLite for scanner history and future automation."
 )
 
 default_symbols = "SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMD"
@@ -195,7 +200,11 @@ if run_scan:
 
         progress.progress((index + 1) / len(symbols))
 
+    save_scanner_results(results)
+
     results_df = pd.DataFrame(results)
+
+    st.success("Scan complete. Results saved to SQLite.")
 
     st.subheader("Scanner Results")
 
@@ -207,7 +216,7 @@ if run_scan:
 
     buy_signals = results_df[results_df["Signal"] == "BUY"]
 
-    st.subheader("Buy Signals")
+    st.subheader("Buy Signals From This Scan")
 
     if buy_signals.empty:
         st.info("No buy signals found.")
@@ -226,3 +235,33 @@ if run_scan:
             file_name="buy_signals.csv",
             mime="text/csv"
         )
+
+st.divider()
+
+st.subheader("Recent Scanner History")
+
+recent_results = get_recent_scanner_results(limit=50)
+
+if recent_results.empty:
+    st.info("No scanner history found yet.")
+else:
+    st.dataframe(
+        recent_results,
+        use_container_width=True,
+        hide_index=True
+    )
+
+st.divider()
+
+st.subheader("Recent Buy Signals")
+
+recent_buys = get_recent_buy_signals(limit=25)
+
+if recent_buys.empty:
+    st.info("No saved buy signals yet.")
+else:
+    st.dataframe(
+        recent_buys,
+        use_container_width=True,
+        hide_index=True
+    )
