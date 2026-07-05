@@ -25,15 +25,21 @@ def run_strategy(
         df["Volume Filter"] = True
 
     df["Signal"] = 0
+    df["Signal Confidence"] = 0
+    df["Signal Reason"] = "No trade"
 
+    buy_condition = (
+        df["Trend Filter"]
+        & df["Momentum Filter"]
+        & df["Volume Filter"]
+    )
+
+    df.loc[buy_condition, "Signal"] = 1
+    df.loc[buy_condition, "Signal Confidence"] = 80
     df.loc[
-        (
-            df["Trend Filter"]
-            & df["Momentum Filter"]
-            & df["Volume Filter"]
-        ),
-        "Signal"
-    ] = 1
+        buy_condition,
+        "Signal Reason"
+    ] = "EMA trend bullish, RSI momentum strong, volume confirmed"
 
     df["Strategy Name"] = "EMA Trend"
     df["Position"] = df["Signal"].shift(1).fillna(0)

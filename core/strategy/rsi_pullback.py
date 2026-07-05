@@ -29,15 +29,21 @@ def run_strategy(
         df["Volume Filter"] = True
 
     df["Signal"] = 0
+    df["Signal Confidence"] = 0
+    df["Signal Reason"] = "No trade"
 
+    buy_condition = (
+        df["Trend Filter"]
+        & df["Momentum Filter"]
+        & df["Volume Filter"]
+    )
+
+    df.loc[buy_condition, "Signal"] = 1
+    df.loc[buy_condition, "Signal Confidence"] = 75
     df.loc[
-        (
-            df["Trend Filter"]
-            & df["Momentum Filter"]
-            & df["Volume Filter"]
-        ),
-        "Signal"
-    ] = 1
+        buy_condition,
+        "Signal Reason"
+    ] = "Bull trend active, RSI recovered from pullback, volume confirmed"
 
     df["Strategy Name"] = "RSI Pullback"
     df["Position"] = df["Signal"].shift(1).fillna(0)

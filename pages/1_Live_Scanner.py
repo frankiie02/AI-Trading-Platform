@@ -43,7 +43,13 @@ period = st.selectbox(
 
 short_ema = st.number_input("Short EMA", min_value=1, value=20)
 long_ema = st.number_input("Long EMA", min_value=2, value=50)
-rsi_threshold = st.number_input("RSI Threshold", min_value=1, max_value=100, value=55)
+
+rsi_threshold = st.number_input(
+    "RSI Threshold",
+    min_value=1,
+    max_value=100,
+    value=55
+)
 
 risk_percent = st.number_input(
     "Risk Per Trade (%)",
@@ -79,6 +85,14 @@ add_to_queue = st.checkbox(
     value=True
 )
 
+minimum_confidence = st.slider(
+    "Minimum Confidence to Queue",
+    min_value=0,
+    max_value=100,
+    value=70,
+    step=5
+)
+
 run_scan = st.button("Run Scan")
 
 if run_scan:
@@ -105,6 +119,8 @@ if run_scan:
                 "Strategy": strategy_name,
                 "Status": "ERROR",
                 "Signal": "NO DATA",
+                "Confidence": 0,
+                "Reason": "No data returned",
                 "Price": None,
                 "RSI": None,
                 "ATR": None,
@@ -137,6 +153,8 @@ if run_scan:
                 "Strategy": strategy_name,
                 "Status": "ERROR",
                 "Signal": "NOT ENOUGH DATA",
+                "Confidence": 0,
+                "Reason": "Not enough indicator history",
                 "Price": None,
                 "RSI": None,
                 "ATR": None,
@@ -177,12 +195,21 @@ if run_scan:
         )
 
         signal = "BUY" if latest["Signal"] == 1 else "NO TRADE"
+        confidence = int(latest.get("Signal Confidence", 0))
+        reason = latest.get("Signal Reason", "No reason available")
+
+        if confidence < minimum_confidence:
+            signal_for_queue = "NO TRADE"
+        else:
+            signal_for_queue = signal
 
         results.append({
             "Symbol": symbol,
             "Strategy": strategy_name,
             "Status": "OK",
-            "Signal": signal,
+            "Signal": signal_for_queue,
+            "Confidence": confidence,
+            "Reason": reason,
             "Price": round(price, 2),
             "RSI": round(float(latest["RSI"]), 2),
             "ATR": round(atr, 2),
@@ -212,8 +239,12 @@ if run_scan:
     )
 
     st.subheader("Scanner Results")
+
     st.dataframe(
-        results_df,
+        results_df.sort_values(
+            by="Confidence",
+            ascending=False
+        ),
         use_container_width=True,
         hide_index=True
     )
@@ -226,7 +257,10 @@ if run_scan:
         st.info("No buy signals found.")
     else:
         st.dataframe(
-            buy_signals,
+            buy_signals.sort_values(
+                by="Confidence",
+                ascending=False
+            ),
             use_container_width=True,
             hide_index=True
         )
