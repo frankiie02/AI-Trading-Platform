@@ -1,0 +1,14 @@
+ib_insync
+pandas
+numpy
+python-dotenv
+pyyaml
+requests
+schedule
+sqlalchemy
+ta
+loguru
+pydantic
+fastapi
+uvicorn
+yfinance
