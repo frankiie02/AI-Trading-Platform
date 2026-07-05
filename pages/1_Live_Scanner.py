@@ -14,15 +14,18 @@ from core.scanner.scanner_repository import (
     get_recent_scanner_results,
     save_scanner_results
 )
-from core.strategy.trend_momentum_strategy import generate_signals
+from core.strategy.strategy_engine import (
+    AVAILABLE_STRATEGIES,
+    generate_strategy_signals
+)
 
 st.set_page_config(page_title="Live Scanner", layout="wide")
 
 st.title("Live Scanner")
 
-st.write(
-    "Scan symbols using the core trading engine. BUY signals are saved "
-    "to SQLite and added to the Trade Queue for approval."
+strategy_name = st.selectbox(
+    "Strategy",
+    AVAILABLE_STRATEGIES
 )
 
 default_symbols = "SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMD"
@@ -38,24 +41,9 @@ period = st.selectbox(
     index=2
 )
 
-short_ema = st.number_input(
-    "Short EMA",
-    min_value=1,
-    value=20
-)
-
-long_ema = st.number_input(
-    "Long EMA",
-    min_value=2,
-    value=50
-)
-
-rsi_threshold = st.number_input(
-    "RSI Threshold",
-    min_value=1,
-    max_value=100,
-    value=55
-)
+short_ema = st.number_input("Short EMA", min_value=1, value=20)
+long_ema = st.number_input("Long EMA", min_value=2, value=50)
+rsi_threshold = st.number_input("RSI Threshold", min_value=1, max_value=100, value=55)
 
 risk_percent = st.number_input(
     "Risk Per Trade (%)",
@@ -114,6 +102,7 @@ if run_scan:
         if data.empty:
             results.append({
                 "Symbol": symbol,
+                "Strategy": strategy_name,
                 "Status": "ERROR",
                 "Signal": "NO DATA",
                 "Price": None,
@@ -131,8 +120,9 @@ if run_scan:
             progress.progress((index + 1) / len(symbols))
             continue
 
-        data = generate_signals(
-            data,
+        data = generate_strategy_signals(
+            df=data,
+            strategy_name=strategy_name,
             short_ema=short_ema,
             long_ema=long_ema,
             rsi_threshold=rsi_threshold,
@@ -144,6 +134,7 @@ if run_scan:
         if clean_data.empty:
             results.append({
                 "Symbol": symbol,
+                "Strategy": strategy_name,
                 "Status": "ERROR",
                 "Signal": "NOT ENOUGH DATA",
                 "Price": None,
@@ -189,6 +180,7 @@ if run_scan:
 
         results.append({
             "Symbol": symbol,
+            "Strategy": strategy_name,
             "Status": "OK",
             "Signal": signal,
             "Price": round(price, 2),
@@ -215,12 +207,11 @@ if run_scan:
     results_df = pd.DataFrame(results)
 
     st.success(
-        f"Scan complete. Results saved to SQLite. "
+        f"Scan complete. Results saved. "
         f"{queued_count} BUY signal(s) added to Trade Queue."
     )
 
     st.subheader("Scanner Results")
-
     st.dataframe(
         results_df,
         use_container_width=True,
