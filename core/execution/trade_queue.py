@@ -128,6 +128,36 @@ def get_pending_trades(db_path=DB_PATH):
     return trades
 
 
+def get_recent_queue_history(limit=50, db_path=DB_PATH):
+    initialise_database(db_path)
+
+    conn = get_connection(db_path)
+
+    history = pd.read_sql_query(
+        """
+        SELECT
+            id AS ID,
+            created_at AS "Created At",
+            symbol AS Symbol,
+            side AS Side,
+            shares AS Shares,
+            price AS Price,
+            status AS Status,
+            source AS Source,
+            updated_at AS "Updated At"
+        FROM trade_queue
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(limit,)
+    )
+
+    conn.close()
+
+    return history
+
+
 def update_trade_status(
     trade_id,
     status,
