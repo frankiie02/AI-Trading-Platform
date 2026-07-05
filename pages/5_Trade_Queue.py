@@ -1,7 +1,6 @@
 import streamlit as st
 
-from config.settings import settings
-from core.execution.paper_trader import PaperTrader
+from core.execution.execution_router import ExecutionRouter
 from core.execution.trade_queue import (
     get_pending_trades,
     get_recent_queue_history,
@@ -13,12 +12,24 @@ st.set_page_config(page_title="Trade Queue", layout="wide")
 st.title("Trade Approval Queue")
 
 st.write(
-    "Review scanner-generated trade ideas. Approving a trade now executes it "
-    "through the paper trading engine and updates the SQLite portfolio."
+    "Review scanner-generated trade ideas. Approving a trade sends it "
+    "through the execution router. Current mode: PAPER."
 )
 
-trader = PaperTrader(
-    starting_balance=settings.STARTING_BALANCE
+execution_mode = st.selectbox(
+    "Execution Mode",
+    ["PAPER", "IBKR_PAPER", "IBKR_LIVE"],
+    index=0
+)
+
+if execution_mode == "IBKR_LIVE":
+    st.error(
+        "Live trading is disabled for safety. This option is visible only "
+        "for future development."
+    )
+
+router = ExecutionRouter(
+    mode=execution_mode
 )
 
 pending_trades = get_pending_trades()
@@ -63,10 +74,11 @@ else:
     c7.metric("Dollar Risk", f"${selected_trade['Dollar Risk']:,.2f}")
 
     st.warning(
-        "Approving this trade will execute it immediately in paper trading mode."
+        "Approving this trade will execute it through the selected "
+        "execution mode."
     )
 
-    approve = st.button("Approve and Execute Paper Trade")
+    approve = st.button("Approve and Execute")
     reject = st.button("Reject Trade")
 
     if approve:
@@ -75,26 +87,12 @@ else:
             status="EXECUTING"
         )
 
-        side = selected_trade["Side"]
-        symbol = selected_trade["Symbol"]
-        shares = int(selected_trade["Shares"])
-        price = float(selected_trade["Price"])
-
-        if side == "BUY":
-            success, message = trader.buy(
-                symbol=symbol,
-                shares=shares,
-                price=price
-            )
-        elif side == "SELL":
-            success, message = trader.sell(
-                symbol=symbol,
-                shares=shares,
-                price=price
-            )
-        else:
-            success = False
-            message = f"Unsupported trade side: {side}"
+        success, message = router.execute_trade(
+            symbol=selected_trade["Symbol"],
+            side=selected_trade["Side"],
+            shares=int(selected_trade["Shares"]),
+            price=float(selected_trade["Price"])
+        )
 
         if success:
             update_trade_status(
