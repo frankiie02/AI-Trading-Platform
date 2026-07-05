@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 
 from config.settings import settings
+from core.execution.trade_queue import save_buy_signals_to_queue
 from core.market_data.yahoo_data import download_price_data
 from core.risk.risk_engine import (
     calculate_atr_stop_loss,
@@ -20,8 +21,8 @@ st.set_page_config(page_title="Live Scanner", layout="wide")
 st.title("Live Scanner")
 
 st.write(
-    "Scan symbols using the core trading engine. Results are displayed "
-    "and saved into SQLite for scanner history and future automation."
+    "Scan symbols using the core trading engine. BUY signals are saved "
+    "to SQLite and added to the Trade Queue for approval."
 )
 
 default_symbols = "SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMD"
@@ -85,6 +86,11 @@ use_volume_filter = st.checkbox(
     value=True
 )
 
+add_to_queue = st.checkbox(
+    "Add BUY signals to Trade Queue",
+    value=True
+)
+
 run_scan = st.button("Run Scan")
 
 if run_scan:
@@ -95,7 +101,6 @@ if run_scan:
     ]
 
     results = []
-
     progress = st.progress(0)
 
     for index, symbol in enumerate(symbols):
@@ -202,9 +207,17 @@ if run_scan:
 
     save_scanner_results(results)
 
+    queued_count = 0
+
+    if add_to_queue:
+        queued_count = save_buy_signals_to_queue(results)
+
     results_df = pd.DataFrame(results)
 
-    st.success("Scan complete. Results saved to SQLite.")
+    st.success(
+        f"Scan complete. Results saved to SQLite. "
+        f"{queued_count} BUY signal(s) added to Trade Queue."
+    )
 
     st.subheader("Scanner Results")
 
@@ -225,15 +238,6 @@ if run_scan:
             buy_signals,
             use_container_width=True,
             hide_index=True
-        )
-
-        csv = buy_signals.to_csv(index=False)
-
-        st.download_button(
-            label="Download Buy Signals CSV",
-            data=csv,
-            file_name="buy_signals.csv",
-            mime="text/csv"
         )
 
 st.divider()

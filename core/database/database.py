@@ -71,6 +71,23 @@ def initialise_database(db_path=DB_PATH):
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trade_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            shares INTEGER NOT NULL,
+            price REAL NOT NULL,
+            stop_loss REAL,
+            take_profit REAL,
+            dollar_risk REAL,
+            status TEXT NOT NULL,
+            source TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
