@@ -2,6 +2,9 @@ import pandas as pd
 import streamlit as st
 
 from config.settings import settings
+from core.alpha.filters import should_queue_trade
+from core.alpha.ranking import rank_opportunities
+from core.alpha.scoring import calculate_alpha_score, classify_alpha_grade
 from core.execution.trade_queue import save_buy_signals_to_queue
 from core.market_data.yahoo_data import download_price_data
 from core.risk.risk_engine import (
@@ -41,8 +44,17 @@ period = st.selectbox(
     index=2
 )
 
-short_ema = st.number_input("Short EMA", min_value=1, value=20)
-long_ema = st.number_input("Long EMA", min_value=2, value=50)
+short_ema = st.number_input(
+    "Short EMA",
+    min_value=1,
+    value=20
+)
+
+long_ema = st.number_input(
+    "Long EMA",
+    min_value=2,
+    value=50
+)
 
 rsi_threshold = st.number_input(
     "RSI Threshold",
@@ -85,8 +97,8 @@ add_to_queue = st.checkbox(
     value=True
 )
 
-minimum_confidence = st.slider(
-    "Minimum Confidence to Queue",
+minimum_alpha_score = st.slider(
+    "Minimum Alpha Score to Queue",
     min_value=0,
     max_value=100,
     value=70,
@@ -120,7 +132,10 @@ if run_scan:
                 "Status": "ERROR",
                 "Signal": "NO DATA",
                 "Confidence": 0,
+                "Alpha Score": 0,
+                "Alpha Grade": "D",
                 "Reason": "No data returned",
+                "Alpha Reasons": "No data returned",
                 "Price": None,
                 "RSI": None,
                 "ATR": None,
@@ -154,7 +169,10 @@ if run_scan:
                 "Status": "ERROR",
                 "Signal": "NOT ENOUGH DATA",
                 "Confidence": 0,
+                "Alpha Score": 0,
+                "Alpha Grade": "D",
                 "Reason": "Not enough indicator history",
+                "Alpha Reasons": "Not enough indicator history",
                 "Price": None,
                 "RSI": None,
                 "ATR": None,
@@ -194,22 +212,32 @@ if run_scan:
             risk_percent=risk_percent
         )
 
-        signal = "BUY" if latest["Signal"] == 1 else "NO TRADE"
+        raw_signal = "BUY" if latest["Signal"] == 1 else "NO TRADE"
         confidence = int(latest.get("Signal Confidence", 0))
         reason = latest.get("Signal Reason", "No reason available")
 
-        if confidence < minimum_confidence:
-            signal_for_queue = "NO TRADE"
+        alpha_score, alpha_reasons = calculate_alpha_score(latest)
+        alpha_grade = classify_alpha_grade(alpha_score)
+
+        if should_queue_trade(
+            signal=raw_signal,
+            alpha_score=alpha_score,
+            minimum_score=minimum_alpha_score
+        ):
+            final_signal = "BUY"
         else:
-            signal_for_queue = signal
+            final_signal = "NO TRADE"
 
         results.append({
             "Symbol": symbol,
             "Strategy": strategy_name,
             "Status": "OK",
-            "Signal": signal_for_queue,
+            "Signal": final_signal,
             "Confidence": confidence,
+            "Alpha Score": alpha_score,
+            "Alpha Grade": alpha_grade,
             "Reason": reason,
+            "Alpha Reasons": alpha_reasons,
             "Price": round(price, 2),
             "RSI": round(float(latest["RSI"]), 2),
             "ATR": round(atr, 2),
@@ -231,36 +259,32 @@ if run_scan:
     if add_to_queue:
         queued_count = save_buy_signals_to_queue(results)
 
-    results_df = pd.DataFrame(results)
+    ranked_results = rank_opportunities(results)
 
     st.success(
         f"Scan complete. Results saved. "
         f"{queued_count} BUY signal(s) added to Trade Queue."
     )
 
-    st.subheader("Scanner Results")
+    st.subheader("Ranked Scanner Results")
 
     st.dataframe(
-        results_df.sort_values(
-            by="Confidence",
-            ascending=False
-        ),
+        ranked_results,
         use_container_width=True,
         hide_index=True
     )
 
-    buy_signals = results_df[results_df["Signal"] == "BUY"]
+    top_opportunities = ranked_results[
+        ranked_results["Signal"] == "BUY"
+    ].head(10)
 
-    st.subheader("Buy Signals From This Scan")
+    st.subheader("Top Tradeable Opportunities")
 
-    if buy_signals.empty:
-        st.info("No buy signals found.")
+    if top_opportunities.empty:
+        st.info("No tradeable opportunities found.")
     else:
         st.dataframe(
-            buy_signals.sort_values(
-                by="Confidence",
-                ascending=False
-            ),
+            top_opportunities,
             use_container_width=True,
             hide_index=True
         )
