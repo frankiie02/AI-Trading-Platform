@@ -2,6 +2,7 @@ import streamlit as st
 
 from config.settings import settings
 from core.execution.paper_trader import PaperTrader
+from core.portfolio.position_monitor import refresh_paper_position_prices
 
 st.set_page_config(
     page_title="Portfolio",
@@ -13,6 +14,20 @@ st.title("Portfolio")
 trader = PaperTrader(
     starting_balance=settings.STARTING_BALANCE
 )
+
+refresh_prices = st.button("Refresh Position Prices")
+
+if refresh_prices:
+    success, message = refresh_paper_position_prices(
+        starting_balance=settings.STARTING_BALANCE
+    )
+
+    if success:
+        st.success(message)
+    else:
+        st.warning(message)
+
+    st.rerun()
 
 summary = trader.get_account_summary()
 positions = trader.get_positions()
@@ -51,11 +66,8 @@ st.divider()
 st.subheader("Open Positions")
 
 if positions.empty:
-
     st.info("No open positions.")
-
 else:
-
     st.dataframe(
         positions,
         use_container_width=True,
@@ -66,8 +78,9 @@ st.divider()
 
 st.subheader("Portfolio Allocation")
 
-if not positions.empty:
-
+if positions.empty:
+    st.info("No allocation to display.")
+else:
     allocation = positions[
         ["Symbol", "Market Value"]
     ].copy()
@@ -83,19 +96,10 @@ st.divider()
 st.subheader("Portfolio Statistics")
 
 if positions.empty:
-
     st.info("Nothing to calculate yet.")
-
 else:
-
-    average_position = (
-        positions["Market Value"].mean()
-    )
-
-    largest_position = (
-        positions["Market Value"].max()
-    )
-
+    average_position = positions["Market Value"].mean()
+    largest_position = positions["Market Value"].max()
     total_positions = len(positions)
 
     s1, s2, s3 = st.columns(3)
