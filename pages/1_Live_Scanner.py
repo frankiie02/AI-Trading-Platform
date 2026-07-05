@@ -1,85 +1,228 @@
-import os
 import pandas as pd
 import streamlit as st
 
 from config.settings import settings
-from engine.scanner import Scanner
-from engine.risk_engine import RiskEngine
-from engine.execution_engine import ExecutionEngine
-from risk.portfolio import Portfolio
+from core.market_data.yahoo_data import download_price_data
+from core.risk.risk_engine import (
+    calculate_atr_stop_loss,
+    calculate_position_size,
+    calculate_take_profit
+)
+from core.strategy.trend_momentum_strategy import generate_signals
+
+st.set_page_config(page_title="Live Scanner", layout="wide")
 
 st.title("Live Scanner")
 
-starting_balance = st.sidebar.number_input(
-    "Starting Balance",
-    value=settings.STARTING_BALANCE
+st.write(
+    "Scan symbols using the core trading engine: market data, strategy, "
+    "risk engine, and signal filters."
 )
 
-risk_percent = st.sidebar.number_input(
-    "Risk % Per Trade",
-    value=float(settings.RISK_PERCENT)
+default_symbols = "SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMD"
+
+symbols_input = st.text_area(
+    "Symbols to scan",
+    value=default_symbols
 )
 
-max_positions = st.sidebar.number_input(
-    "Maximum Open Positions",
-    value=settings.MAX_OPEN_POSITIONS
+period = st.selectbox(
+    "Data Period",
+    ["3mo", "6mo", "1y", "2y"],
+    index=2
 )
 
-symbols = st.sidebar.multiselect(
-    "Symbols",
-    options=settings.SYMBOLS,
-    default=settings.SYMBOLS
+short_ema = st.number_input(
+    "Short EMA",
+    min_value=1,
+    value=20
 )
 
-portfolio = Portfolio(
-    starting_balance=starting_balance,
-    max_open_positions=max_positions
+long_ema = st.number_input(
+    "Long EMA",
+    min_value=2,
+    value=50
 )
 
-scanner = Scanner(symbols)
-risk_engine = RiskEngine(risk_percent=risk_percent)
-execution_engine = ExecutionEngine()
+rsi_threshold = st.number_input(
+    "RSI Threshold",
+    min_value=1,
+    max_value=100,
+    value=55
+)
 
-if st.button("Run Market Scan"):
-    signals = scanner.scan()
-    trade_log = []
+risk_percent = st.number_input(
+    "Risk Per Trade (%)",
+    min_value=0.1,
+    max_value=10.0,
+    value=1.0,
+    step=0.1
+)
 
-    if not signals:
-        st.warning("No BUY signals found.")
+atr_multiplier = st.number_input(
+    "ATR Stop Multiplier",
+    min_value=0.5,
+    max_value=10.0,
+    value=2.0,
+    step=0.5
+)
+
+reward_risk_ratio = st.number_input(
+    "Reward/Risk Ratio",
+    min_value=0.5,
+    max_value=10.0,
+    value=2.0,
+    step=0.5
+)
+
+use_volume_filter = st.checkbox(
+    "Use Volume Filter",
+    value=True
+)
+
+run_scan = st.button("Run Scan")
+
+if run_scan:
+    symbols = [
+        symbol.strip().upper()
+        for symbol in symbols_input.split(",")
+        if symbol.strip()
+    ]
+
+    results = []
+
+    progress = st.progress(0)
+
+    for index, symbol in enumerate(symbols):
+        data = download_price_data(
+            symbol=symbol,
+            period=period,
+            interval="1d",
+            auto_adjust=True
+        )
+
+        if data.empty:
+            results.append({
+                "Symbol": symbol,
+                "Status": "ERROR",
+                "Signal": "NO DATA",
+                "Price": None,
+                "RSI": None,
+                "ATR": None,
+                "Trend": "FAIL",
+                "Momentum": "FAIL",
+                "Volume": "FAIL",
+                "Suggested Shares": 0,
+                "Stop Loss": None,
+                "Take Profit": None,
+                "Dollar Risk": 0
+            })
+
+            progress.progress((index + 1) / len(symbols))
+            continue
+
+        data = generate_signals(
+            data,
+            short_ema=short_ema,
+            long_ema=long_ema,
+            rsi_threshold=rsi_threshold,
+            use_volume_filter=use_volume_filter
+        )
+
+        clean_data = data.dropna()
+
+        if clean_data.empty:
+            results.append({
+                "Symbol": symbol,
+                "Status": "ERROR",
+                "Signal": "NOT ENOUGH DATA",
+                "Price": None,
+                "RSI": None,
+                "ATR": None,
+                "Trend": "FAIL",
+                "Momentum": "FAIL",
+                "Volume": "FAIL",
+                "Suggested Shares": 0,
+                "Stop Loss": None,
+                "Take Profit": None,
+                "Dollar Risk": 0
+            })
+
+            progress.progress((index + 1) / len(symbols))
+            continue
+
+        latest = clean_data.iloc[-1]
+
+        price = float(latest["Close"])
+        atr = float(latest["ATR"])
+
+        stop_loss = calculate_atr_stop_loss(
+            entry_price=price,
+            atr=atr,
+            atr_multiplier=atr_multiplier
+        )
+
+        take_profit = calculate_take_profit(
+            entry_price=price,
+            stop_loss_price=stop_loss,
+            reward_risk_ratio=reward_risk_ratio
+        )
+
+        shares, risk_amount = calculate_position_size(
+            account_balance=settings.STARTING_BALANCE,
+            entry_price=price,
+            stop_loss_price=stop_loss,
+            risk_percent=risk_percent
+        )
+
+        signal = "BUY" if latest["Signal"] == 1 else "NO TRADE"
+
+        results.append({
+            "Symbol": symbol,
+            "Status": "OK",
+            "Signal": signal,
+            "Price": round(price, 2),
+            "RSI": round(float(latest["RSI"]), 2),
+            "ATR": round(atr, 2),
+            "Trend": "PASS" if latest["Trend Filter"] else "FAIL",
+            "Momentum": "PASS" if latest["Momentum Filter"] else "FAIL",
+            "Volume": "PASS" if latest["Volume Filter"] else "FAIL",
+            "Suggested Shares": shares,
+            "Stop Loss": round(stop_loss, 2),
+            "Take Profit": round(take_profit, 2),
+            "Dollar Risk": round(risk_amount, 2)
+        })
+
+        progress.progress((index + 1) / len(symbols))
+
+    results_df = pd.DataFrame(results)
+
+    st.subheader("Scanner Results")
+
+    st.dataframe(
+        results_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    buy_signals = results_df[results_df["Signal"] == "BUY"]
+
+    st.subheader("Buy Signals")
+
+    if buy_signals.empty:
+        st.info("No buy signals found.")
     else:
-        for signal in signals:
-            trade, reason = risk_engine.approve_signal(signal, portfolio)
+        st.dataframe(
+            buy_signals,
+            use_container_width=True,
+            hide_index=True
+        )
 
-            st.subheader(signal.symbol)
-            st.write(f"Strategy: {signal.strategy}")
-            st.write(f"Confidence: {signal.confidence:.2f}")
-            st.write(f"Score: {signal.score}/3")
-            st.write(f"Risk Decision: {reason}")
+        csv = buy_signals.to_csv(index=False)
 
-            if trade:
-                result = execution_engine.execute_trade(trade, portfolio)
-
-                if result["approved"]:
-                    trade_log.append({
-                        "Symbol": trade.symbol,
-                        "Strategy": signal.strategy,
-                        "Confidence": signal.confidence,
-                        "Score": signal.score,
-                        "Shares": trade.shares,
-                        "Entry Price": trade.entry_price,
-                        "Stop Loss": trade.stop_loss,
-                        "Take Profit": trade.take_profit,
-                        "Capital Used": trade.capital,
-                        "Cash Remaining": result["cash_remaining"]
-                    })
-
-        if trade_log:
-            df = pd.DataFrame(trade_log)
-            os.makedirs("logs", exist_ok=True)
-            df.to_csv(settings.DASHBOARD_TRADE_LOG_PATH, index=False)
-
-            st.subheader("Executed Trades")
-            st.dataframe(df, use_container_width=True)
-
-st.subheader("Portfolio Summary")
-st.json(portfolio.summary())
+        st.download_button(
+            label="Download Buy Signals CSV",
+            data=csv,
+            file_name="buy_signals.csv",
+            mime="text/csv"
+        )
