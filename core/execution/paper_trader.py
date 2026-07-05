@@ -39,22 +39,6 @@ class PaperTrader:
 
         return float(row["cash"])
 
-    def _set_cash(self, cash):
-        conn = get_connection(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            UPDATE account_state
-            SET cash = ?, updated_at = ?
-            WHERE id = 1
-        """, (
-            float(cash),
-            self._now()
-        ))
-
-        conn.commit()
-        conn.close()
-
     def _log_trade(self, symbol, side, shares, price, value, cash_after_trade):
         conn = get_connection(self.db_path)
         cursor = conn.cursor()
@@ -95,6 +79,9 @@ class PaperTrader:
                 current_price AS "Current Price",
                 market_value AS "Market Value",
                 unrealised_pnl AS "Unrealised PnL",
+                stop_loss AS "Stop Loss",
+                take_profit AS "Take Profit",
+                trailing_stop AS "Trailing Stop",
                 updated_at AS "Updated At"
             FROM paper_positions
             ORDER BY symbol
@@ -133,7 +120,15 @@ class PaperTrader:
 
         return trades
 
-    def buy(self, symbol, shares, price):
+    def buy(
+        self,
+        symbol,
+        shares,
+        price,
+        stop_loss=None,
+        take_profit=None,
+        trailing_stop=None
+    ):
         symbol = symbol.upper()
         shares = int(shares)
         price = float(price)
@@ -177,6 +172,9 @@ class PaperTrader:
                     current_price = ?,
                     market_value = ?,
                     unrealised_pnl = ?,
+                    stop_loss = COALESCE(?, stop_loss),
+                    take_profit = COALESCE(?, take_profit),
+                    trailing_stop = COALESCE(?, trailing_stop),
                     updated_at = ?
                 WHERE symbol = ?
             """, (
@@ -185,6 +183,9 @@ class PaperTrader:
                 price,
                 market_value,
                 unrealised_pnl,
+                stop_loss,
+                take_profit,
+                trailing_stop,
                 self._now(),
                 symbol
             ))
@@ -198,9 +199,12 @@ class PaperTrader:
                     current_price,
                     market_value,
                     unrealised_pnl,
+                    stop_loss,
+                    take_profit,
+                    trailing_stop,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol,
                 shares,
@@ -208,6 +212,9 @@ class PaperTrader:
                 price,
                 cost,
                 0,
+                stop_loss,
+                take_profit,
+                trailing_stop,
                 self._now()
             ))
 
@@ -361,6 +368,86 @@ class PaperTrader:
 
         conn.commit()
         conn.close()
+
+    def update_position_levels(
+        self,
+        symbol,
+        stop_loss=None,
+        take_profit=None,
+        trailing_stop=None
+    ):
+        symbol = symbol.upper()
+
+        conn = get_connection(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT symbol FROM paper_positions WHERE symbol = ?",
+            (symbol,)
+        )
+
+        position = cursor.fetchone()
+
+        if position is None:
+            conn.close()
+            return False, f"No open position found for {symbol}."
+
+        cursor.execute("""
+            UPDATE paper_positions
+            SET
+                stop_loss = ?,
+                take_profit = ?,
+                trailing_stop = ?,
+                updated_at = ?
+            WHERE symbol = ?
+        """, (
+            stop_loss,
+            take_profit,
+            trailing_stop,
+            self._now(),
+            symbol
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return True, f"Updated order levels for {symbol}."
+
+    def set_break_even(self, symbol):
+        symbol = symbol.upper()
+
+        conn = get_connection(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT entry_price, take_profit, trailing_stop FROM paper_positions WHERE symbol = ?",
+            (symbol,)
+        )
+
+        position = cursor.fetchone()
+
+        if position is None:
+            conn.close()
+            return False, f"No open position found for {symbol}."
+
+        entry_price = float(position["entry_price"])
+
+        cursor.execute("""
+            UPDATE paper_positions
+            SET
+                stop_loss = ?,
+                updated_at = ?
+            WHERE symbol = ?
+        """, (
+            entry_price,
+            self._now(),
+            symbol
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return True, f"Stop-loss moved to break-even for {symbol}."
 
     def get_account_summary(self):
         cash = self._get_cash()

@@ -13,6 +13,16 @@ def get_connection(db_path=DB_PATH):
     return conn
 
 
+def add_column_if_missing(cursor, table_name, column_name, column_definition):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = [row["name"] for row in cursor.fetchall()]
+
+    if column_name not in columns:
+        cursor.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+        )
+
+
 def initialise_database(db_path=DB_PATH):
     conn = get_connection(db_path)
     cursor = conn.cursor()
@@ -37,6 +47,10 @@ def initialise_database(db_path=DB_PATH):
             updated_at TEXT NOT NULL
         )
     """)
+
+    add_column_if_missing(cursor, "paper_positions", "stop_loss", "REAL")
+    add_column_if_missing(cursor, "paper_positions", "take_profit", "REAL")
+    add_column_if_missing(cursor, "paper_positions", "trailing_stop", "REAL")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS paper_trades (
