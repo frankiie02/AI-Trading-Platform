@@ -26,3 +26,21 @@ def download_price_data(
     data.dropna(inplace=True)
 
     return data
+
+
+def get_price_history(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d"
+):
+    data = download_price_data(
+        symbol=symbol,
+        period=period,
+        interval=interval,
+        auto_adjust=False
+    )
+
+    if data.empty:
+        raise ValueError(f"No market data returned for {symbol}")
+
+    return data.reset_index()

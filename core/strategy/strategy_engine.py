@@ -1,12 +1,14 @@
 from core.strategy import breakout
 from core.strategy import ema_trend
+from core.strategy import macd_momentum
 from core.strategy import rsi_pullback
 
 
 AVAILABLE_STRATEGIES = [
     "EMA Trend",
     "RSI Pullback",
-    "Breakout"
+    "Breakout",
+    "MACD Momentum"
 ]
 
 
@@ -38,6 +40,15 @@ def generate_strategy_signals(
 
     if strategy_name == "Breakout":
         return breakout.run_strategy(
+            df=df,
+            short_ema=short_ema,
+            long_ema=long_ema,
+            rsi_threshold=rsi_threshold,
+            use_volume_filter=use_volume_filter
+        )
+
+    if strategy_name == "MACD Momentum":
+        return macd_momentum.run_strategy(
             df=df,
             short_ema=short_ema,
             long_ema=long_ema,

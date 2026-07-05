@@ -62,6 +62,37 @@ def add_volume_average(df, window=20):
     return df
 
 
+def add_macd(
+    df,
+    column="Close",
+    fast_window=12,
+    slow_window=26,
+    signal_window=9
+):
+    df = df.copy()
+
+    fast_ema = df[column].ewm(
+        span=fast_window,
+        adjust=False
+    ).mean()
+
+    slow_ema = df[column].ewm(
+        span=slow_window,
+        adjust=False
+    ).mean()
+
+    df["MACD"] = fast_ema - slow_ema
+
+    df["MACD Signal"] = df["MACD"].ewm(
+        span=signal_window,
+        adjust=False
+    ).mean()
+
+    df["MACD Histogram"] = df["MACD"] - df["MACD Signal"]
+
+    return df
+
+
 def add_all_indicators(
     df,
     short_ema=20,
@@ -92,5 +123,7 @@ def add_all_indicators(
         df,
         window=volume_window
     )
+
+    df = add_macd(df)
 
     return df
