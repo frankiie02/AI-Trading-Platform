@@ -9,13 +9,12 @@ st.set_page_config(page_title="Paper Trading", layout="wide")
 st.title("Paper Trading")
 
 st.write(
-    "Simulate trades using virtual cash before connecting to a real broker."
+    "Simulate trades using virtual cash before connecting to a real broker. "
+    "This page now stores paper trades and positions in SQLite."
 )
 
 trader = PaperTrader(
-    starting_balance=settings.STARTING_BALANCE,
-    portfolio_path="data/paper_portfolio.csv",
-    trade_log_path="data/paper_trade_log.csv"
+    starting_balance=settings.STARTING_BALANCE
 )
 
 summary = trader.get_account_summary()
@@ -90,7 +89,9 @@ if price_mode == "Latest Market Price":
     )
 
     if data.empty:
-        st.warning("Could not fetch latest market price. Use manual price instead.")
+        st.warning(
+            "Could not fetch latest market price. Use manual price instead."
+        )
     else:
         latest_price = float(data["Close"].iloc[-1])
         st.info(f"Latest price for {symbol}: ${latest_price:,.2f}")
@@ -124,11 +125,13 @@ st.divider()
 
 st.subheader("Open Positions")
 
-if trader.positions.empty:
+positions = trader.get_positions()
+
+if positions.empty:
     st.info("No open paper positions yet.")
 else:
     st.dataframe(
-        trader.positions,
+        positions,
         use_container_width=True,
         hide_index=True
     )
@@ -137,19 +140,13 @@ st.divider()
 
 st.subheader("Paper Trade Log")
 
-try:
-    import pandas as pd
+trade_log = trader.get_trade_log()
 
-    trade_log = pd.read_csv("data/paper_trade_log.csv")
-
-    if trade_log.empty:
-        st.info("No paper trades logged yet.")
-    else:
-        st.dataframe(
-            trade_log,
-            use_container_width=True,
-            hide_index=True
-        )
-
-except FileNotFoundError:
+if trade_log.empty:
     st.info("No paper trades logged yet.")
+else:
+    st.dataframe(
+        trade_log,
+        use_container_width=True,
+        hide_index=True
+    )

@@ -1,225 +1,387 @@
-import os
-import pandas as pd
 from datetime import datetime
+
+import pandas as pd
+
+from core.database.database import (
+    DB_PATH,
+    get_connection,
+    initialise_account,
+    initialise_database
+)
 
 
 class PaperTrader:
     def __init__(
         self,
         starting_balance=100000,
-        portfolio_path="data/paper_portfolio.csv",
-        trade_log_path="data/paper_trade_log.csv"
+        db_path=DB_PATH
     ):
-        self.starting_balance = starting_balance
-        self.portfolio_path = portfolio_path
-        self.trade_log_path = trade_log_path
+        self.starting_balance = float(starting_balance)
+        self.db_path = db_path
 
-        os.makedirs(os.path.dirname(self.portfolio_path), exist_ok=True)
-        os.makedirs(os.path.dirname(self.trade_log_path), exist_ok=True)
+        initialise_database(self.db_path)
+        initialise_account(self.starting_balance, self.db_path)
 
-        self.cash = self._load_cash()
-        self.positions = self._load_positions()
+    def _now(self):
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def _load_cash(self):
-        if os.path.exists(self.portfolio_path):
-            portfolio = pd.read_csv(self.portfolio_path)
+    def _get_cash(self):
+        conn = get_connection(self.db_path)
+        cursor = conn.cursor()
 
-            if not portfolio.empty and "Cash" in portfolio.columns:
-                return float(portfolio["Cash"].iloc[-1])
+        cursor.execute("SELECT cash FROM account_state WHERE id = 1")
+        row = cursor.fetchone()
 
-        return float(self.starting_balance)
+        conn.close()
 
-    def _load_positions(self):
-        if os.path.exists(self.portfolio_path):
-            portfolio = pd.read_csv(self.portfolio_path)
+        if row is None:
+            return self.starting_balance
 
-            required_columns = [
-                "Symbol",
-                "Shares",
-                "Entry Price",
-                "Current Price",
-                "Market Value",
-                "Unrealised PnL"
-            ]
+        return float(row["cash"])
 
-            if all(col in portfolio.columns for col in required_columns):
-                return portfolio[required_columns].copy()
+    def _set_cash(self, cash):
+        conn = get_connection(self.db_path)
+        cursor = conn.cursor()
 
-        return pd.DataFrame(
-            columns=[
-                "Symbol",
-                "Shares",
-                "Entry Price",
-                "Current Price",
-                "Market Value",
-                "Unrealised PnL"
-            ]
+        cursor.execute("""
+            UPDATE account_state
+            SET cash = ?, updated_at = ?
+            WHERE id = 1
+        """, (
+            float(cash),
+            self._now()
+        ))
+
+        conn.commit()
+        conn.close()
+
+    def _log_trade(self, symbol, side, shares, price, value, cash_after_trade):
+        conn = get_connection(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO paper_trades (
+                timestamp,
+                symbol,
+                side,
+                shares,
+                price,
+                value,
+                cash_after_trade
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            self._now(),
+            symbol.upper(),
+            side.upper(),
+            int(shares),
+            float(price),
+            float(value),
+            float(cash_after_trade)
+        ))
+
+        conn.commit()
+        conn.close()
+
+    def get_positions(self):
+        conn = get_connection(self.db_path)
+
+        positions = pd.read_sql_query(
+            """
+            SELECT
+                symbol AS Symbol,
+                shares AS Shares,
+                entry_price AS "Entry Price",
+                current_price AS "Current Price",
+                market_value AS "Market Value",
+                unrealised_pnl AS "Unrealised PnL",
+                updated_at AS "Updated At"
+            FROM paper_positions
+            ORDER BY symbol
+            """,
+            conn
         )
 
+        conn.close()
+
+        return positions
+
+    @property
+    def positions(self):
+        return self.get_positions()
+
+    def get_trade_log(self):
+        conn = get_connection(self.db_path)
+
+        trades = pd.read_sql_query(
+            """
+            SELECT
+                timestamp AS Timestamp,
+                symbol AS Symbol,
+                side AS Side,
+                shares AS Shares,
+                price AS Price,
+                value AS Value,
+                cash_after_trade AS "Cash After Trade"
+            FROM paper_trades
+            ORDER BY id DESC
+            """,
+            conn
+        )
+
+        conn.close()
+
+        return trades
+
     def buy(self, symbol, shares, price):
+        symbol = symbol.upper()
+        shares = int(shares)
+        price = float(price)
+
         if shares <= 0:
             return False, "Shares must be greater than zero."
 
+        cash = self._get_cash()
         cost = shares * price
 
-        if cost > self.cash:
+        if cost > cash:
             return False, "Not enough cash to place this trade."
 
-        existing_position = self.positions[
-            self.positions["Symbol"] == symbol
-        ]
+        conn = get_connection(self.db_path)
+        cursor = conn.cursor()
 
-        if not existing_position.empty:
-            index = existing_position.index[0]
+        cursor.execute(
+            "SELECT * FROM paper_positions WHERE symbol = ?",
+            (symbol,)
+        )
 
-            old_shares = self.positions.loc[index, "Shares"]
-            old_entry = self.positions.loc[index, "Entry Price"]
+        position = cursor.fetchone()
+
+        if position:
+            old_shares = int(position["shares"])
+            old_entry = float(position["entry_price"])
 
             new_shares = old_shares + shares
             new_entry = (
                 (old_shares * old_entry) + (shares * price)
             ) / new_shares
 
-            self.positions.loc[index, "Shares"] = new_shares
-            self.positions.loc[index, "Entry Price"] = new_entry
-            self.positions.loc[index, "Current Price"] = price
+            market_value = new_shares * price
+            unrealised_pnl = (price - new_entry) * new_shares
+
+            cursor.execute("""
+                UPDATE paper_positions
+                SET
+                    shares = ?,
+                    entry_price = ?,
+                    current_price = ?,
+                    market_value = ?,
+                    unrealised_pnl = ?,
+                    updated_at = ?
+                WHERE symbol = ?
+            """, (
+                new_shares,
+                new_entry,
+                price,
+                market_value,
+                unrealised_pnl,
+                self._now(),
+                symbol
+            ))
+
         else:
-            new_position = pd.DataFrame([{
-                "Symbol": symbol,
-                "Shares": shares,
-                "Entry Price": price,
-                "Current Price": price,
-                "Market Value": shares * price,
-                "Unrealised PnL": 0
-            }])
+            cursor.execute("""
+                INSERT INTO paper_positions (
+                    symbol,
+                    shares,
+                    entry_price,
+                    current_price,
+                    market_value,
+                    unrealised_pnl,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                symbol,
+                shares,
+                price,
+                price,
+                cost,
+                0,
+                self._now()
+            ))
 
-            self.positions = pd.concat(
-                [self.positions, new_position],
-                ignore_index=True
-            )
+        new_cash = cash - cost
 
-        self.cash -= cost
-        self._update_market_values()
-        self._save_state()
-        self._log_trade(symbol, "BUY", shares, price, cost)
+        cursor.execute("""
+            UPDATE account_state
+            SET cash = ?, updated_at = ?
+            WHERE id = 1
+        """, (
+            new_cash,
+            self._now()
+        ))
+
+        conn.commit()
+        conn.close()
+
+        self._log_trade(
+            symbol=symbol,
+            side="BUY",
+            shares=shares,
+            price=price,
+            value=cost,
+            cash_after_trade=new_cash
+        )
 
         return True, f"Bought {shares} shares of {symbol} at ${price:,.2f}."
 
     def sell(self, symbol, shares, price):
+        symbol = symbol.upper()
+        shares = int(shares)
+        price = float(price)
+
         if shares <= 0:
             return False, "Shares must be greater than zero."
 
-        position = self.positions[
-            self.positions["Symbol"] == symbol
-        ]
+        conn = get_connection(self.db_path)
+        cursor = conn.cursor()
 
-        if position.empty:
+        cursor.execute(
+            "SELECT * FROM paper_positions WHERE symbol = ?",
+            (symbol,)
+        )
+
+        position = cursor.fetchone()
+
+        if position is None:
+            conn.close()
             return False, f"No open position found for {symbol}."
 
-        index = position.index[0]
-        current_shares = self.positions.loc[index, "Shares"]
+        current_shares = int(position["shares"])
 
         if shares > current_shares:
+            conn.close()
             return False, "Cannot sell more shares than currently held."
 
+        cash = self._get_cash()
         proceeds = shares * price
+        remaining_shares = current_shares - shares
 
-        self.positions.loc[index, "Shares"] = current_shares - shares
-        self.positions.loc[index, "Current Price"] = price
+        if remaining_shares == 0:
+            cursor.execute(
+                "DELETE FROM paper_positions WHERE symbol = ?",
+                (symbol,)
+            )
+        else:
+            entry_price = float(position["entry_price"])
+            market_value = remaining_shares * price
+            unrealised_pnl = (price - entry_price) * remaining_shares
 
-        if self.positions.loc[index, "Shares"] == 0:
-            self.positions = self.positions.drop(index).reset_index(drop=True)
+            cursor.execute("""
+                UPDATE paper_positions
+                SET
+                    shares = ?,
+                    current_price = ?,
+                    market_value = ?,
+                    unrealised_pnl = ?,
+                    updated_at = ?
+                WHERE symbol = ?
+            """, (
+                remaining_shares,
+                price,
+                market_value,
+                unrealised_pnl,
+                self._now(),
+                symbol
+            ))
 
-        self.cash += proceeds
-        self._update_market_values()
-        self._save_state()
-        self._log_trade(symbol, "SELL", shares, price, proceeds)
+        new_cash = cash + proceeds
+
+        cursor.execute("""
+            UPDATE account_state
+            SET cash = ?, updated_at = ?
+            WHERE id = 1
+        """, (
+            new_cash,
+            self._now()
+        ))
+
+        conn.commit()
+        conn.close()
+
+        self._log_trade(
+            symbol=symbol,
+            side="SELL",
+            shares=shares,
+            price=price,
+            value=proceeds,
+            cash_after_trade=new_cash
+        )
 
         return True, f"Sold {shares} shares of {symbol} at ${price:,.2f}."
 
     def update_prices(self, price_map):
+        conn = get_connection(self.db_path)
+        cursor = conn.cursor()
+
         for symbol, price in price_map.items():
-            mask = self.positions["Symbol"] == symbol
+            symbol = symbol.upper()
+            price = float(price)
 
-            if mask.any():
-                self.positions.loc[mask, "Current Price"] = price
-
-        self._update_market_values()
-        self._save_state()
-
-    def _update_market_values(self):
-        if self.positions.empty:
-            return
-
-        self.positions["Market Value"] = (
-            self.positions["Shares"] *
-            self.positions["Current Price"]
-        )
-
-        self.positions["Unrealised PnL"] = (
-            self.positions["Current Price"] -
-            self.positions["Entry Price"]
-        ) * self.positions["Shares"]
-
-    def _save_state(self):
-        portfolio = self.positions.copy()
-
-        if portfolio.empty:
-            portfolio = pd.DataFrame(
-                columns=[
-                    "Symbol",
-                    "Shares",
-                    "Entry Price",
-                    "Current Price",
-                    "Market Value",
-                    "Unrealised PnL"
-                ]
+            cursor.execute(
+                "SELECT * FROM paper_positions WHERE symbol = ?",
+                (symbol,)
             )
 
-        portfolio["Cash"] = self.cash
-        portfolio["Updated At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            position = cursor.fetchone()
 
-        portfolio.to_csv(self.portfolio_path, index=False)
+            if position:
+                shares = int(position["shares"])
+                entry_price = float(position["entry_price"])
 
-    def _log_trade(self, symbol, side, shares, price, value):
-        trade = pd.DataFrame([{
-            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Symbol": symbol,
-            "Side": side,
-            "Shares": shares,
-            "Price": price,
-            "Value": value,
-            "Cash After Trade": self.cash
-        }])
+                market_value = shares * price
+                unrealised_pnl = (price - entry_price) * shares
 
-        if os.path.exists(self.trade_log_path):
-            existing = pd.read_csv(self.trade_log_path)
-            trade_log = pd.concat([existing, trade], ignore_index=True)
-        else:
-            trade_log = trade
+                cursor.execute("""
+                    UPDATE paper_positions
+                    SET
+                        current_price = ?,
+                        market_value = ?,
+                        unrealised_pnl = ?,
+                        updated_at = ?
+                    WHERE symbol = ?
+                """, (
+                    price,
+                    market_value,
+                    unrealised_pnl,
+                    self._now(),
+                    symbol
+                ))
 
-        trade_log.to_csv(self.trade_log_path, index=False)
+        conn.commit()
+        conn.close()
 
     def get_account_summary(self):
-        total_market_value = (
-            self.positions["Market Value"].sum()
-            if not self.positions.empty
-            else 0
-        )
+        cash = self._get_cash()
+        positions = self.get_positions()
 
-        unrealised_pnl = (
-            self.positions["Unrealised PnL"].sum()
-            if not self.positions.empty
-            else 0
-        )
+        if positions.empty:
+            market_value = 0
+            unrealised_pnl = 0
+            open_positions = 0
+        else:
+            market_value = float(positions["Market Value"].sum())
+            unrealised_pnl = float(positions["Unrealised PnL"].sum())
+            open_positions = len(positions)
 
-        portfolio_value = self.cash + total_market_value
+        portfolio_value = cash + market_value
 
         return {
             "Starting Balance": self.starting_balance,
-            "Cash": self.cash,
-            "Market Value": total_market_value,
+            "Cash": cash,
+            "Market Value": market_value,
             "Portfolio Value": portfolio_value,
             "Unrealised PnL": unrealised_pnl,
-            "Open Positions": len(self.positions),
+            "Open Positions": open_positions,
         }

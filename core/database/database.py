@@ -8,7 +8,9 @@ DB_PATH = "data/trading_platform.db"
 
 def get_connection(db_path=DB_PATH):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    return sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def initialise_database(db_path=DB_PATH):
@@ -16,15 +18,11 @@ def initialise_database(db_path=DB_PATH):
     cursor = conn.cursor()
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS paper_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            shares INTEGER NOT NULL,
-            price REAL NOT NULL,
-            value REAL NOT NULL,
-            cash_after_trade REAL NOT NULL
+        CREATE TABLE IF NOT EXISTS account_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            starting_balance REAL NOT NULL,
+            cash REAL NOT NULL,
+            updated_at TEXT NOT NULL
         )
     """)
 
@@ -41,11 +39,15 @@ def initialise_database(db_path=DB_PATH):
     """)
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS account_state (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            starting_balance REAL NOT NULL,
-            cash REAL NOT NULL,
-            updated_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            shares INTEGER NOT NULL,
+            price REAL NOT NULL,
+            value REAL NOT NULL,
+            cash_after_trade REAL NOT NULL
         )
     """)
 
