@@ -12,4 +12,4 @@ exports/
 .ipynb_checkpoints/
 .pytest_cache/
 .coverage
-htmlcov/
+htmlcov/*.save
