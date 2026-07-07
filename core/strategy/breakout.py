@@ -1,6 +1,3 @@
-from core.indicators.technical_indicators import add_all_indicators
-
-
 def run_strategy(
     df,
     short_ema=20,
@@ -9,12 +6,6 @@ def run_strategy(
     use_volume_filter=True
 ):
     df = df.copy()
-
-    df = add_all_indicators(
-        df,
-        short_ema=short_ema,
-        long_ema=long_ema
-    )
 
     df["Previous High"] = df["High"].rolling(
         window=20

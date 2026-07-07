@@ -1,3 +1,4 @@
+from core.indicators.pipeline import build_indicator_pipeline
 from core.strategy.registry import (
     get_available_strategies,
     get_strategy
@@ -15,13 +16,22 @@ def generate_strategy_signals(
     rsi_threshold=55,
     use_volume_filter=True
 ):
+    if df.empty:
+        return df
+
+    enriched_df = build_indicator_pipeline(
+        df=df,
+        short_ema=short_ema,
+        long_ema=long_ema
+    )
+
     strategy_function = get_strategy(strategy_name)
 
     if strategy_function is None:
         strategy_function = get_strategy("EMA Trend")
 
     return strategy_function(
-        df=df,
+        df=enriched_df,
         short_ema=short_ema,
         long_ema=long_ema,
         rsi_threshold=rsi_threshold,
