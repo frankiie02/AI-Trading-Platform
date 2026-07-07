@@ -7,6 +7,8 @@ from core.alpha.ranking import rank_opportunities
 from core.alpha.scoring import calculate_alpha_score, classify_alpha_grade
 from core.execution.trade_queue import save_buy_signals_to_queue
 from core.market_data.yahoo_data import download_price_data
+from core.regime.detector import detect_market_regime
+from core.regime.filters import strategy_allowed
 from core.risk.risk_engine import (
     calculate_atr_stop_loss,
     calculate_position_size,
@@ -92,6 +94,11 @@ use_volume_filter = st.checkbox(
     value=True
 )
 
+use_regime_filter = st.checkbox(
+    "Use Market Regime Filter",
+    value=True
+)
+
 add_to_queue = st.checkbox(
     "Add BUY signals to Trade Queue",
     value=True
@@ -136,6 +143,9 @@ if run_scan:
                 "Alpha Grade": "D",
                 "Reason": "No data returned",
                 "Alpha Reasons": "No data returned",
+                "Market Regime": "Unknown",
+                "Strategy Allowed": "NO",
+                "Regime Reason": "No data available",
                 "Price": None,
                 "RSI": None,
                 "ATR": None,
@@ -173,6 +183,9 @@ if run_scan:
                 "Alpha Grade": "D",
                 "Reason": "Not enough indicator history",
                 "Alpha Reasons": "Not enough indicator history",
+                "Market Regime": "Unknown",
+                "Strategy Allowed": "NO",
+                "Regime Reason": "Not enough indicator history",
                 "Price": None,
                 "RSI": None,
                 "ATR": None,
@@ -187,6 +200,14 @@ if run_scan:
 
             progress.progress((index + 1) / len(symbols))
             continue
+
+        market_regime = detect_market_regime(clean_data)
+        is_strategy_allowed = strategy_allowed(strategy_name, market_regime)
+
+        if is_strategy_allowed:
+            regime_reason = f"{strategy_name} is allowed in {market_regime.value} market."
+        else:
+            regime_reason = f"{strategy_name} is blocked in {market_regime.value} market."
 
         latest = clean_data.iloc[-1]
 
@@ -219,14 +240,20 @@ if run_scan:
         alpha_score, alpha_reasons = calculate_alpha_score(latest)
         alpha_grade = classify_alpha_grade(alpha_score)
 
-        if should_queue_trade(
+        queue_allowed_by_alpha = should_queue_trade(
             signal=raw_signal,
             alpha_score=alpha_score,
             minimum_score=minimum_alpha_score
-        ):
-            final_signal = "BUY"
+        )
+
+        if use_regime_filter:
+            final_signal = (
+                "BUY"
+                if queue_allowed_by_alpha and is_strategy_allowed
+                else "NO TRADE"
+            )
         else:
-            final_signal = "NO TRADE"
+            final_signal = "BUY" if queue_allowed_by_alpha else "NO TRADE"
 
         results.append({
             "Symbol": symbol,
@@ -238,6 +265,9 @@ if run_scan:
             "Alpha Grade": alpha_grade,
             "Reason": reason,
             "Alpha Reasons": alpha_reasons,
+            "Market Regime": market_regime.value,
+            "Strategy Allowed": "YES" if is_strategy_allowed else "NO",
+            "Regime Reason": regime_reason,
             "Price": round(price, 2),
             "RSI": round(float(latest["RSI"]), 2),
             "ATR": round(atr, 2),

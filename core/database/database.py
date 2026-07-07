@@ -85,6 +85,16 @@ def initialise_database(db_path=DB_PATH):
         )
     """)
 
+    add_column_if_missing(cursor, "scanner_results", "strategy", "TEXT")
+    add_column_if_missing(cursor, "scanner_results", "confidence", "REAL")
+    add_column_if_missing(cursor, "scanner_results", "alpha_score", "REAL")
+    add_column_if_missing(cursor, "scanner_results", "alpha_grade", "TEXT")
+    add_column_if_missing(cursor, "scanner_results", "reason", "TEXT")
+    add_column_if_missing(cursor, "scanner_results", "alpha_reasons", "TEXT")
+    add_column_if_missing(cursor, "scanner_results", "market_regime", "TEXT")
+    add_column_if_missing(cursor, "scanner_results", "strategy_allowed", "TEXT")
+    add_column_if_missing(cursor, "scanner_results", "regime_reason", "TEXT")
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS trade_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
