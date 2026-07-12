@@ -1,4 +1,6 @@
 DEFAULT_SETTINGS = {
+    "RUNTIME_MODE": "research",
+
     "STARTING_BALANCE": 100000,
     "EXECUTION_MODE": "PAPER",
 
