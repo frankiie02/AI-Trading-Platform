@@ -1,5 +1,37 @@
 # AI Trading Platform — Claude Development Instructions
 
+## Service Design Philosophy
+
+This project intentionally uses workflow-oriented orchestration services.
+
+A service may be several hundred lines long when it represents one coherent business workflow.
+
+Services should coordinate existing domain modules rather than reimplement their algorithms.
+
+Do not split a service into multiple files solely to reduce line count.
+
+Keep algorithms such as indicators, strategy calculations, regime detection, alpha scoring, risk calculations, persistence and broker execution in their existing dedicated modules.
+
+Split an orchestration service only when:
+
+- it owns multiple unrelated business capabilities;
+- it contains duplicated workflows;
+- it begins implementing domain algorithms itself;
+- or separation would materially improve testability, correctness or maintainability.
+
+Large orchestration services are acceptable when their workflow remains cohesive, testable and clearly structured.
+
+## Refactoring Rule
+
+When extracting logic from an existing module:
+
+1. Preserve observable behaviour.
+2. Limit behavioural changes to bug fixes that improve correctness or resilience.
+3. Do not introduce new features.
+4. Preserve existing persistence formats unless explicitly redesigning contracts.
+5. Isolate external side effects behind injected collaborators.
+6. Add regression tests proving behaviour before and after extraction.
+
 ## Architectural Self Review
 
 Before presenting any implementation:
@@ -323,3 +355,4 @@ Strategy Registry
     -> Portfolio Validation
     -> Order Creation
     -> Execution
+```
