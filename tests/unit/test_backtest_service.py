@@ -373,6 +373,122 @@ def test_same_bar_stop_and_target_collision_assumes_stop_first():
 
 
 # ---------------------------------------------------------------------------
+# Entry-bar isolation: stop/target evaluation must not begin until the bar
+# after entry - entry and exit can never land on the same bar.
+# ---------------------------------------------------------------------------
+
+def test_entry_bar_take_profit_breach_does_not_close_position():
+    rows = [
+        (100, 101, 99, 100),
+        (100, 101, 99, 100),   # decision bar (len=2)
+        (100, 120, 99, 101),   # entry bar: open=100; High=120 >= target(110) - must be ignored
+        (100, 101, 99, 100),   # back in range
+        (100, 101, 99, 100),
+        (100, 101, 99, 100),   # final bar -> forced close
+    ]
+    data = make_frame(rows)
+    decision_fn = buy_once_at_length(2, stop_loss=95.0, take_profit=110.0, suggested_shares=10)
+
+    service, _ = build_service(decision_fn, market_data_fn=lambda **kwargs: data)
+    result = service.run(build_request())
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_timestamp != trade.exit_timestamp
+    assert trade.exit_reason == "End of backtest period"
+    assert trade.exit_timestamp == data.index[-1]
+
+
+def test_entry_bar_stop_loss_breach_does_not_close_position():
+    rows = [
+        (100, 101, 99, 100),
+        (100, 101, 99, 100),   # decision bar (len=2)
+        (100, 102, 80, 101),   # entry bar: open=100; Low=80 <= stop(95) - must be ignored
+        (100, 102, 99, 101),   # back in range
+        (100, 102, 99, 101),
+        (100, 102, 99, 101),   # final bar -> forced close
+    ]
+    data = make_frame(rows)
+    decision_fn = buy_once_at_length(2, stop_loss=95.0, take_profit=110.0, suggested_shares=10)
+
+    service, _ = build_service(decision_fn, market_data_fn=lambda **kwargs: data)
+    result = service.run(build_request())
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_timestamp != trade.exit_timestamp
+    assert trade.exit_reason == "End of backtest period"
+    assert trade.exit_timestamp == data.index[-1]
+
+
+def test_bar_after_entry_can_trigger_stop_loss():
+    rows = [
+        (100, 101, 99, 100),
+        (100, 101, 99, 100),   # decision bar (len=2)
+        (100, 102, 99, 101),   # entry bar: open=100, in range - no exit possible here
+        (98, 99, 94, 95),      # bar after entry: Low=94 <= stop(95) -> STOP_LOSS
+        (95, 96, 94, 95),
+        (95, 96, 94, 95),
+    ]
+    data = make_frame(rows)
+    decision_fn = buy_once_at_length(2, stop_loss=95.0, take_profit=110.0, suggested_shares=10)
+
+    service, _ = build_service(decision_fn, market_data_fn=lambda **kwargs: data)
+    result = service.run(build_request())
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "STOP_LOSS"
+    assert trade.exit_timestamp == data.index[3]
+    assert trade.entry_timestamp == data.index[2]
+
+
+def test_bar_after_entry_can_trigger_take_profit():
+    rows = [
+        (100, 101, 99, 100),
+        (100, 101, 99, 100),   # decision bar (len=2)
+        (100, 102, 99, 101),   # entry bar: open=100, in range - no exit possible here
+        (105, 111, 104, 110),  # bar after entry: High=111 >= target(110) -> TAKE_PROFIT
+        (110, 111, 109, 110),
+        (110, 111, 109, 110),
+    ]
+    data = make_frame(rows)
+    decision_fn = buy_once_at_length(2, stop_loss=95.0, take_profit=110.0, suggested_shares=10)
+
+    service, _ = build_service(decision_fn, market_data_fn=lambda **kwargs: data)
+    result = service.run(build_request())
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "TAKE_PROFIT"
+    assert trade.exit_timestamp == data.index[3]
+    assert trade.entry_timestamp == data.index[2]
+
+
+def test_adverse_first_collision_on_entry_bar_is_ignored_but_applies_on_later_bar():
+    rows = [
+        (100, 101, 99, 100),
+        (100, 101, 99, 100),   # decision bar (len=2)
+        (100, 112, 90, 101),   # entry bar: both stop(90<=95) and target(112>=110) touched - ignored
+        (100, 112, 90, 100),   # bar after entry: both touched again -> adverse-first STOP_LOSS
+        (100, 101, 99, 100),
+        (100, 101, 99, 100),
+    ]
+    data = make_frame(rows)
+    decision_fn = buy_once_at_length(2, stop_loss=95.0, take_profit=110.0, suggested_shares=10)
+
+    service, _ = build_service(decision_fn, market_data_fn=lambda **kwargs: data)
+    result = service.run(build_request())
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "STOP_LOSS"
+    assert trade.exit_price == 95.0
+    assert trade.exit_timestamp == data.index[3]
+    assert trade.entry_timestamp == data.index[2]
+
+
+# ---------------------------------------------------------------------------
 # 14. Final-bar forced close
 # ---------------------------------------------------------------------------
 

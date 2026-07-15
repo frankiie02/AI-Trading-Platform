@@ -110,6 +110,7 @@ class BacktestResult:
 @dataclass
 class _OpenPosition:
     entry_timestamp: pd.Timestamp
+    entry_bar_index: int
     entry_price: float
     quantity: int
     stop_loss: float
@@ -135,11 +136,13 @@ class BacktestService:
     never defined stop-loss/take-profit/position-sizing behaviour):
       - A decision is made at bar t using only data through bar t
         (`data.loc[:t]`, i.e. no lookahead).
-      - A BUY decision is entered at the next bar's Open.
-      - Stop-loss/take-profit (as computed by TradingPipeline's existing
-        ATR-based risk engine) are checked every bar from the entry bar
-        onward using that bar's High/Low. If both are touched in the same
-        bar, the stop-loss is assumed to trigger first (adverse-first).
+      - A BUY decision is entered at the next bar's Open. That entry bar's
+        High/Low are never checked against the stop-loss/take-profit -
+        entry and exit can never occur on the same bar. Stop-loss/take
+        profit (as computed by TradingPipeline's existing ATR-based risk
+        engine) are checked starting the bar *after* entry, using that
+        bar's High/Low. If both are touched in the same bar, the stop-loss
+        is assumed to trigger first (adverse-first).
       - Position sizing uses currently available cash (no leverage), and
         stop-loss/take-profit/suggested-share values are taken as-is from
         TradingPipeline's decision (computed relative to the signal bar's
@@ -259,6 +262,7 @@ class BacktestService:
                     request=request,
                     bar=bar,
                     entry_timestamp=current_ts,
+                    entry_bar_index=i,
                     decision=pending_entry,
                     cash=cash
                 )
@@ -269,7 +273,10 @@ class BacktestService:
                     )
                 pending_entry = None
 
-            if position is not None:
+            # Stop-loss/take-profit are never evaluated on the bar a
+            # position was just filled on - entry and exit can never land
+            # on the same bar. Evaluation begins the bar after entry.
+            if position is not None and i > position.entry_bar_index:
                 exit_price, exit_reason = self._check_stop_target(position, bar)
 
                 if exit_price is not None:
@@ -381,6 +388,7 @@ class BacktestService:
         request: BacktestRequest,
         bar: pd.Series,
         entry_timestamp: pd.Timestamp,
+        entry_bar_index: int,
         decision,
         cash: float
     ) -> Optional[_OpenPosition]:
@@ -393,6 +401,7 @@ class BacktestService:
 
         return _OpenPosition(
             entry_timestamp=entry_timestamp,
+            entry_bar_index=entry_bar_index,
             entry_price=entry_price,
             quantity=quantity,
             stop_loss=decision.stop_loss,
