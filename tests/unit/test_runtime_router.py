@@ -37,7 +37,7 @@ def make_context(mode):
 
 @pytest.mark.parametrize(
     "mode",
-    [RuntimeMode.RESEARCH, RuntimeMode.BACKTEST, RuntimeMode.PAPER],
+    [RuntimeMode.RESEARCH, RuntimeMode.PAPER],
 )
 def test_route_returns_not_implemented_result_for_placeholder_modes(mode):
     router = RuntimeRouter()
@@ -79,6 +79,30 @@ def test_route_scanner_mode_delegates_to_scanner_runtime(monkeypatch):
 
     router = RuntimeRouter()
     context = make_context(RuntimeMode.SCANNER)
+
+    result = router.route(context)
+
+    assert len(calls) == 1
+    assert calls[0] is context
+    assert result.status == "completed"
+
+
+def test_route_backtest_mode_delegates_to_backtest_runtime(monkeypatch):
+    """BACKTEST must no longer be a placeholder: routing it should call the
+    dedicated backtest-runtime coordinator rather than RuntimeRouter itself
+    implementing backtest logic."""
+    import core.runtime.backtest_runtime as backtest_runtime
+
+    calls = []
+
+    def fake_run_backtest(context):
+        calls.append(context)
+        return RuntimeResult(mode=RuntimeMode.BACKTEST, status="completed", message="ok")
+
+    monkeypatch.setattr(backtest_runtime, "run_backtest", fake_run_backtest)
+
+    router = RuntimeRouter()
+    context = make_context(RuntimeMode.BACKTEST)
 
     result = router.route(context)
 

@@ -55,6 +55,28 @@ DEFAULT_SETTINGS = {
     "SCANNER_MINIMUM_ALPHA_SCORE": 70,
     "SCANNER_QUEUE_TRADES": False,
 
+    # Standalone backtest runtime (core/runtime/backtest_runtime.py) and the
+    # Backtesting Streamlit page (pages/3_Backtesting.py), both of which call
+    # BacktestService. Kept separate from SCANNER_*/DEFAULT_* settings so the
+    # unattended runtime has its own safe, small default configuration.
+    "BACKTEST_SYMBOL": "SPY",
+    "BACKTEST_PERIOD": "2y",
+    "BACKTEST_INTERVAL": "1d",
+    "BACKTEST_STRATEGY_MODE": "single",
+    "BACKTEST_STRATEGY": "EMA Trend",
+    "BACKTEST_INITIAL_CAPITAL": 100000,
+    "BACKTEST_SHORT_EMA": 20,
+    "BACKTEST_LONG_EMA": 50,
+    "BACKTEST_RSI_THRESHOLD": 55,
+    "BACKTEST_USE_VOLUME_FILTER": True,
+    "BACKTEST_USE_REGIME_FILTER": True,
+    "BACKTEST_RISK_PERCENT": 1.0,
+    "BACKTEST_ATR_MULTIPLIER": 2.0,
+    "BACKTEST_REWARD_RISK_RATIO": 2.0,
+    "BACKTEST_MINIMUM_ALPHA_SCORE": 70,
+    "BACKTEST_COMMISSION": 0.0,
+    "BACKTEST_SLIPPAGE": 0.0,
+
     "DATABASE_PATH": "data/trading_platform.db",
 
     "IBKR_HOST": "127.0.0.1",

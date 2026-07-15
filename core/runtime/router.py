@@ -6,7 +6,6 @@ from core.runtime.modes import RuntimeMode
 
 _NOT_YET_IMPLEMENTED_MODES = (
     RuntimeMode.RESEARCH,
-    RuntimeMode.BACKTEST,
     RuntimeMode.PAPER,
 )
 
@@ -47,6 +46,14 @@ class RuntimeRouter:
             from core.runtime.scanner_runtime import run_scanner
 
             return run_scanner(context)
+
+        if mode is RuntimeMode.BACKTEST:
+            # Imported lazily for the same reason as the scanner runtime
+            # above - keeps RuntimeRouter's own imports free of market-data/
+            # pipeline dependencies.
+            from core.runtime.backtest_runtime import run_backtest
+
+            return run_backtest(context)
 
         if mode in _NOT_YET_IMPLEMENTED_MODES:
             context.logger.info(

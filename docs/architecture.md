@@ -24,7 +24,7 @@ Market Data → Indicators → Strategy Engine → Regime Engine → Alpha Engin
 - `core/database`: SQLite database layer.
 - `core/runtime`: minimal application bootstrap and runtime-mode routing (see below).
 - `core/services`: reusable, Streamlit-free orchestration services for dashboard workflows (see below).
-- `core/pipeline`: the shared `TradingPipeline` decision workflow used by `ScannerService` and (in future milestones) `BacktestService`/`PaperTradingService`/`LiveTradingService` (see below).
+- `core/pipeline`: the shared `TradingPipeline` decision workflow used by `ScannerService` and `BacktestService` (and, in a future milestone, `PaperTradingService`/`LiveTradingService`) (see below).
 
 ## Runtime Bootstrap
 
@@ -69,7 +69,68 @@ It is a pure decision workflow with **no** market-data downloading, Streamlit re
   - Voting cannot bypass regime, alpha, or risk controls — the same `use_regime_filter` / `minimum_alpha_score` / risk-calculation gates apply to both paths.
 - Every collaborator (strategy generation, voting, indicator pipeline, regime detection/filter, alpha scoring/grading, queue-eligibility, stop-loss/take-profit/position-size) is injected via constructor defaults (no DI framework), so `TradingPipeline` contains no Streamlit, database, or broker code and can be tested with fakes.
 - `TradingPipeline` performs no persistence and no broker side effects. Live trading remains disabled regardless of pipeline output — nothing in `TradingPipeline` submits orders.
-- Reuse plan: `BacktestService`, `PaperTradingService`, and a future `LiveTradingService` are all expected to build a `TradingPipelineRequest` per symbol/bar and call `TradingPipeline.evaluate()`, so the indicator → strategy/voting → regime → alpha → risk decision logic is implemented exactly once. None of those services exist yet — this milestone only extracts and wires the pipeline for `ScannerService`.
+- Reuse plan: `BacktestService` now builds a `TradingPipelineRequest` per historical bar and calls `TradingPipeline.evaluate()`, exactly as `ScannerService` does per symbol. `PaperTradingService` and a future `LiveTradingService` are expected to do the same, so the indicator → strategy/voting → regime → alpha → risk decision logic remains implemented exactly once across every consumer.
+
+## Backtest Service
+
+`BacktestService` (`core/services/backtest_service.py`) is the reusable, testable historical-backtesting workflow, used by both `pages/3_Backtesting.py` (Streamlit) and the standalone `backtest` runtime mode:
+
+```text
+market data → chronological bar-by-bar iteration → TradingPipeline.evaluate() per bar → simulated entry/exit → BacktestTrade → equity curve → performance metrics
+```
+
+Key points:
+
+- **Anti-lookahead**: for each bar `t`, `BacktestService` evaluates `TradingPipeline.evaluate()` on `data.iloc[: t + 1]` (i.e. `data.loc[:t]`) only — the pipeline never receives any row beyond the current bar. This is enforced structurally (the historical slice is constructed before every call) and covered by a dedicated regression test that injects an extreme future price spike and asserts it cannot influence any earlier decision.
+- **Execution convention** (adopted because the pre-existing Backtesting page never defined a stop-loss/take-profit/position-sizing rule at all — see "Known limitations" below): a BUY decision made using data through bar `t` is entered at bar `t+1`'s Open. Stop-loss/take-profit — taken as-is from `TradingPipeline`'s existing ATR-based risk-engine output — are checked every bar from the entry bar onward using that bar's High/Low; if both are touched in the same bar, the stop-loss is assumed to trigger first (adverse-first). Only one long position per symbol is held at a time; there is no short selling or leverage. Any position still open at the final bar is force-closed at the final available close. Position sizing uses currently available cash (no leverage) and the share count `TradingPipeline` already computed via the existing risk engine (`core/risk/risk_engine.py`), capped by what available cash can afford.
+- **No new algorithms**: `BacktestService` does not reimplement indicators, strategy signals, voting, regime detection, alpha scoring, or risk/position-sizing formulas — all of that is delegated to the unchanged `TradingPipeline`. `BacktestService` owns only backtest-specific orchestration: market-data retrieval, the anti-lookahead loop, simulated fills, cash/equity bookkeeping, commission/slippage application, trade recording, and performance-metric calculation.
+- **Error isolation**: a bar where `TradingPipeline` raises `InsufficientDataError` (indicator warm-up, e.g. the first ~50 bars for a 50-period EMA) is silently skipped and summarised as a single warning at the end (`"Skipped N bar(s)..."`); any other `TradingPipelineError` on a given bar is recorded as a warning and that bar is treated as "no decision", without aborting the rest of the backtest. Invalid requests (`InvalidBacktestRequestError`) and market-data failures (`BacktestDataError`) are raised immediately and are not swallowed.
+- **Strategy modes**: both `ScanStrategyMode.SINGLE` and `ScanStrategyMode.VOTING` are supported, exactly mirroring `ScannerService`'s modes — voting mode therefore inherits the strict-majority voting-regime rule, alpha filtering, and risk controls with no new formula.
+- `BacktestService` performs no persistence, no Streamlit rendering, no broker/live calls, and makes no real network or database calls in tests (verified by injected fakes and a `yfinance.download`/`sqlite3.connect` guard test, mirroring `TradingPipeline`'s and `ScannerService`'s own test conventions).
+
+## Standalone Backtest Runtime
+
+`core/runtime/backtest_runtime.py` provides `run_backtest(context, service=None)`, the standalone coordinator for `RuntimeMode.BACKTEST`, following the exact same shape as `run_scanner`:
+
+1. `build_backtest_request(context.settings)` builds a `BacktestRequest` from the `BACKTEST_*` configuration keys (`config/defaults.py`), falling back to their defaults for any key absent from `context.settings`.
+2. Calls `BacktestService.run()` (a real `BacktestService()` by default — paper/local only, no broker).
+3. Returns a `RuntimeResult` with a concise terminal summary (symbol, trade count, total return, max drawdown, final equity).
+4. Performs no persistence.
+
+`backtest_runtime.py` imports no Streamlit, broker, or live-execution module. `RuntimeRouter` now dispatches `RuntimeMode.BACKTEST` to it (imported lazily inside `route()`, matching the scanner dispatch pattern) instead of returning a placeholder "not implemented" result; `research` and `paper` remain placeholders.
+
+### Backtest runtime configuration keys (`config/defaults.py`)
+
+| Key | Default |
+|---|---|
+| `BACKTEST_SYMBOL` | `"SPY"` |
+| `BACKTEST_PERIOD` | `"2y"` |
+| `BACKTEST_INTERVAL` | `"1d"` |
+| `BACKTEST_STRATEGY_MODE` | `"single"` |
+| `BACKTEST_STRATEGY` | `"EMA Trend"` |
+| `BACKTEST_INITIAL_CAPITAL` | `100000` |
+| `BACKTEST_SHORT_EMA` | `20` |
+| `BACKTEST_LONG_EMA` | `50` |
+| `BACKTEST_RSI_THRESHOLD` | `55` |
+| `BACKTEST_USE_VOLUME_FILTER` | `True` |
+| `BACKTEST_USE_REGIME_FILTER` | `True` |
+| `BACKTEST_RISK_PERCENT` | `1.0` |
+| `BACKTEST_ATR_MULTIPLIER` | `2.0` |
+| `BACKTEST_REWARD_RISK_RATIO` | `2.0` |
+| `BACKTEST_MINIMUM_ALPHA_SCORE` | `70` |
+| `BACKTEST_COMMISSION` | `0.0` |
+| `BACKTEST_SLIPPAGE` | `0.0` |
+
+## Backtesting Page
+
+`pages/3_Backtesting.py` is a thin UI adapter, mirroring `pages/1_Live_Scanner.py`'s structure: it builds a `BacktestRequest` from widget values (including a Single Strategy / Strategy Voting mode control, matching the Live Scanner UX), calls `BacktestService.run()`, and renders the returned `BacktestResult` (metrics, equity curve, trade log, warnings/controlled errors). It no longer downloads market data, evaluates `TradingPipeline`, or computes performance metrics directly — those all live in `BacktestService`.
+
+### Known limitations / deferred work
+
+- The old return-multiplier backtest model (`core/analytics/performance.py`, `calculate_performance`/`extract_trades`) is **not used by `BacktestService`** and remains untouched: it never supported stop-loss, take-profit, position sizing, commissions, or voting mode, so it could not satisfy the new `BacktestTrade` contract. `BacktestService` computes its own discrete-trade equity curve and metrics (using the same Sharpe/CAGR/drawdown formulas for consistency) directly from the simulated trades.
+- `BacktestTrade.stop_loss`/`take_profit`/`suggested_shares` are taken as-is from `TradingPipeline`'s decision, which computes them relative to the **signal bar's close**, not the actual next-bar-open fill price. This is a deliberate simplification consistent with not duplicating the existing risk-engine formulas.
+- No walk-forward analysis, parameter optimisation, Monte Carlo simulation, short selling, leverage, or persistent backtest storage — all explicitly out of scope for this milestone.
+- No separate benchmark-symbol input: the benchmark is always a buy-and-hold of the backtested symbol itself, matching the old page's implicit "Market Equity" comparison.
 
 ## Scanner Service
 
