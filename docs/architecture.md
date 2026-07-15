@@ -24,6 +24,7 @@ Market Data → Indicators → Strategy Engine → Regime Engine → Alpha Engin
 - `core/database`: SQLite database layer.
 - `core/runtime`: minimal application bootstrap and runtime-mode routing (see below).
 - `core/services`: reusable, Streamlit-free orchestration services for dashboard workflows (see below).
+- `core/pipeline`: the shared `TradingPipeline` decision workflow used by `ScannerService` and (in future milestones) `BacktestService`/`PaperTradingService`/`LiveTradingService` (see below).
 
 ## Runtime Bootstrap
 
@@ -51,25 +52,40 @@ Runtime mode is selected via the `RUNTIME_MODE` configuration key (`config/defau
 
 The existing Streamlit dashboard (`streamlit run dashboard.py` and `pages/`) remains a separate, independent entry point and is unaffected by this bootstrap. It is not launched by `main.py`, and `main.py` does not import Streamlit, broker, execution, or strategy modules.
 
-## Scanner Service
+## Trading Pipeline
 
-`ScannerService` (`core/services/scanner_service.py`) is the single reusable, testable implementation of the Live Scanner business workflow. It is used by both `pages/1_Live_Scanner.py` (Streamlit) and the standalone `scanner` runtime mode:
+`TradingPipeline` (`core/pipeline/trading_pipeline.py`) is the single reusable, testable implementation of the market-data-independent trading-decision workflow:
 
 ```text
-market data → strategy signals (single-strategy or voting) → regime detection → regime filter → risk (stop-loss / take-profit / position size) → alpha score → alpha grade → queue eligibility → BUY / NO TRADE decision
+indicators → single strategy or strategy voting → regime detection → regime permission → alpha scoring/grading → ATR stop-loss / take-profit / position sizing → queue eligibility → BUY / NO TRADE decision
+```
+
+It is a pure decision workflow with **no** market-data downloading, Streamlit rendering, scanner-result or trade-queue persistence, database access, runtime routing, broker submission, portfolio mutation, or live execution. It takes one `TradingPipelineRequest` (one symbol's already-downloaded raw price frame plus decision parameters — strategy mode/name, EMA/RSI settings, regime-filter flag, account balance, risk percent, ATR multiplier, reward/risk ratio, minimum alpha score) and returns one `TradingDecision` (`core/pipeline/models.py`), or raises a typed `TradingPipelineError` subclass (`InsufficientDataError`, `InvalidStrategyConfigurationError`, `PipelineEvaluationError`) on an operational failure. It never encodes operational failures as a trading signal.
+
+- **Single-strategy path**: calls `generate_strategy_signals` (`core/strategy/strategy_engine.py`) via the existing strategy registry — unchanged from the original `ScannerService` extraction.
+- **Voting path**: calls the existing voting engine (`run_strategy_voting`, `core/voting/engine.py`) for the BUY/NO TRADE consensus decision, and separately calls `build_indicator_pipeline` (`core/indicators/pipeline.py`) — the same enrichment function the voting engine already uses internally — to obtain the enriched price row that regime detection, alpha scoring, and risk calculations need but the voting engine's dict result does not expose. Both are pure functions of the same input, so this does not duplicate or alter any algorithm; it only assembles the additional input the shared downstream steps require. (Indicator enrichment therefore still runs twice in voting mode — once explicitly, once inside the voting engine — exactly as before extraction.)
+  - Voting-mode regime allowance: since `strategy_allowed()` (`core/regime/filters.py`) only evaluates a single named strategy, a voting BUY is regime-permitted only when a **strict majority** of the strategies that voted BUY would individually be allowed to trade in the detected regime. Zero BUY votes, or exactly half allowed, both fail the gate. This reuses the existing per-strategy regime rule unchanged; it does not introduce a new regime formula.
+  - Voting-mode alpha scoring input: `Trend Filter` and `Volume Filter` are derived from the same primitives every registered strategy already uses (`Short EMA > Long EMA`, `Volume > Volume Average`); `Momentum Filter` is approximated by the voting engine's own consensus gate (`buy_votes >= 2`), since there is no single shared momentum formula across strategies. The alpha-scoring formula itself is untouched.
+  - Voting cannot bypass regime, alpha, or risk controls — the same `use_regime_filter` / `minimum_alpha_score` / risk-calculation gates apply to both paths.
+- Every collaborator (strategy generation, voting, indicator pipeline, regime detection/filter, alpha scoring/grading, queue-eligibility, stop-loss/take-profit/position-size) is injected via constructor defaults (no DI framework), so `TradingPipeline` contains no Streamlit, database, or broker code and can be tested with fakes.
+- `TradingPipeline` performs no persistence and no broker side effects. Live trading remains disabled regardless of pipeline output — nothing in `TradingPipeline` submits orders.
+- Reuse plan: `BacktestService`, `PaperTradingService`, and a future `LiveTradingService` are all expected to build a `TradingPipelineRequest` per symbol/bar and call `TradingPipeline.evaluate()`, so the indicator → strategy/voting → regime → alpha → risk decision logic is implemented exactly once. None of those services exist yet — this milestone only extracts and wires the pipeline for `ScannerService`.
+
+## Scanner Service
+
+`ScannerService` (`core/services/scanner_service.py`) remains the single reusable, testable implementation of the Live Scanner business workflow. It is used by both `pages/1_Live_Scanner.py` (Streamlit) and the standalone `scanner` runtime mode:
+
+```text
+market data → TradingPipeline.evaluate() → SymbolScanOutcome → persistence → trade queue → ranking → scan statistics
 ```
 
 Key points:
 
 - `pages/1_Live_Scanner.py` is a thin UI adapter: it builds a `ScanRequest` from widget values, calls `ScannerService.scan()`, and renders the `ScanResult`. It no longer imports market data, strategy generation, regime, alpha, risk, or persistence collaborators directly — only historical reads (`get_recent_scanner_results`, `get_recent_buy_signals`) remain in the page for the history panels.
-- `ScanRequest.strategy_mode` (`ScanStrategyMode` enum: `SINGLE` / `VOTING`) selects between the two supported paths. It defaults to `SINGLE`, so existing callers that never set it are unaffected.
-- **Single-strategy path**: unchanged from the original extraction — calls `generate_strategy_signals` (`core/strategy/strategy_engine.py`) via the existing strategy registry.
-- **Voting path**: calls the existing voting engine (`run_strategy_voting`, `core/voting/engine.py`) for the BUY/NO TRADE consensus decision, and separately calls `build_indicator_pipeline` (`core/indicators/pipeline.py`) — the same enrichment function the voting engine already uses internally — to obtain the enriched price row that regime detection, alpha scoring, and risk calculations need but the voting engine's dict result does not expose. Both are pure functions of the same input, so this does not duplicate or alter any algorithm; it only assembles the additional input the shared downstream steps require.
-  - Voting-mode regime allowance: since `strategy_allowed()` (`core/regime/filters.py`) only evaluates a single named strategy, a voting BUY is regime-permitted only when a **strict majority** of the strategies that voted BUY would individually be allowed to trade in the detected regime. This reuses the existing per-strategy regime rule unchanged; it does not introduce a new regime formula.
-  - Voting-mode alpha scoring input: `Trend Filter` and `Volume Filter` are derived from the same primitives every registered strategy already uses (`Short EMA > Long EMA`, `Volume > Volume Average`); `Momentum Filter` is approximated by the voting engine's own consensus gate (`buy_votes >= 2`), since there is no single shared momentum formula across strategies. The alpha-scoring formula itself is untouched.
-  - Voting cannot bypass regime, alpha, or risk controls — the same `use_regime_filter` / `minimum_alpha_score` / risk-calculation gates apply to both paths.
-- Every external collaborator (market data, strategy generation, voting, indicator pipeline, regime detection/filter, alpha scoring/grading, risk calculations, scanner-result persistence, trade-queue persistence, ranking) is injected via constructor defaults, so the service contains no Streamlit, database, or broker code directly and can be tested with fakes.
-- Each symbol is processed with its own exception handling; one symbol's failure (missing data, insufficient indicator history, strategy/voting failure, or an unexpected error) produces a controlled error outcome (`SymbolScanOutcome`, `status="ERROR"`) without stopping the rest of the scan. Error labels (`NO DATA`, `NOT ENOUGH DATA`, `SCAN ERROR`) are distinct sentinel values, never `BUY`/`SELL`/`NO TRADE`.
+- `ScanRequest.strategy_mode` (`ScanStrategyMode` enum: `SINGLE` / `VOTING`, defined in `core/pipeline/models.py` and re-exported from `core.services.scanner_service` for backward compatibility) selects between the two supported paths. It defaults to `SINGLE`, so existing callers that never set it are unaffected.
+- **`ScannerService` no longer calls the strategy engine, voting engine, indicator pipeline, regime detector/filter, alpha scorer/grader, or risk calculators directly.** For each symbol it downloads market data, builds a `TradingPipelineRequest` (carrying the symbol's raw price frame plus the request's decision parameters and the service's configured `account_balance`), and calls `TradingPipeline.evaluate()`. The returned `TradingDecision` is mapped into the existing `SymbolScanOutcome` shape.
+- `ScannerService` retains: symbol normalisation/iteration, market-data retrieval, per-symbol exception isolation (translating `InsufficientDataError` → `NOT ENOUGH DATA` and any other `TradingPipelineError` → `SCAN ERROR`, matching the exact error labels and reason strings used before extraction), progress callbacks, persistence, trade-queue writes, ranking, and scan statistics.
+- Each symbol is processed with its own exception handling; one symbol's failure (missing data, a pipeline `TradingPipelineError`, or an unexpected error) produces a controlled error outcome (`SymbolScanOutcome`, `status="ERROR"`) without stopping the rest of the scan. Error labels (`NO DATA`, `NOT ENOUGH DATA`, `SCAN ERROR`) are distinct sentinel values, never `BUY`/`SELL`/`NO TRADE`.
 - Persistence and trade-queue writes remain fully delegated to the existing `save_scanner_results` and `save_buy_signals_to_queue` collaborators — the service does not duplicate their database logic. A failure in either raises a dedicated `ScannerPersistenceError` / `TradeQueuePersistenceError` rather than being silently swallowed.
 - `SymbolScanOutcome.to_legacy_dict()` reproduces the exact dictionary shape the existing repository, trade-queue, and ranking functions expect, so those consumers require no changes. Voting-only fields (`Vote Score`, `BUY Votes`, `Total Votes`) are added to the dict only for voting outcomes — single-strategy outcomes are never given meaningless voting defaults. `save_scanner_results`/`save_buy_signals_to_queue` read known keys via `dict.get(...)`, so these extra keys are ignored by persistence: **voting metadata (vote score, buy/total votes, and the full per-strategy `strategy_votes` list) lives in memory/the ranked table only and is not written to the (unchanged) `scanner_results` database schema.**
 

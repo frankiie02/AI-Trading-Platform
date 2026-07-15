@@ -4,6 +4,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from core.pipeline.models import ScanStrategyMode as PipelineScanStrategyMode
+from core.pipeline.models import TradingDecision
+from core.pipeline.trading_pipeline import PipelineEvaluationError, TradingPipeline
 from core.regime.market_state import MarketState
 from core.services.scanner_service import (
     ScanRequest,
@@ -14,11 +17,11 @@ from core.services.scanner_service import (
     TradeQueuePersistenceError,
 )
 
-# NOTE: core.voting was forbidden here in Stage 1, when voting was
-# explicitly deferred. This scanner milestone requires ScannerService to
-# invoke the voting engine directly (Part 3), so that restriction no longer
-# applies; the remaining prefixes (Streamlit/dashboard/broker/runtime/live
-# broker SDK) are unaffected and still forbidden.
+# scanner_service.py must no longer import Streamlit/dashboard/broker/runtime
+# code, NOR the individual decision-workflow collaborators (strategy engine,
+# voting engine, regime detector/filter, alpha scoring/filters, risk engine,
+# indicator pipeline) directly - those now live exclusively behind
+# TradingPipeline (core/pipeline/trading_pipeline.py).
 FORBIDDEN_IMPORT_PREFIXES = (
     "streamlit",
     "pages",
@@ -26,6 +29,17 @@ FORBIDDEN_IMPORT_PREFIXES = (
     "core.broker",
     "core.runtime",
     "ib_insync",
+)
+
+FORBIDDEN_DIRECT_COLLABORATOR_MODULES = (
+    "core.strategy.strategy_engine",
+    "core.voting.engine",
+    "core.regime.detector",
+    "core.regime.filters",
+    "core.alpha.scoring",
+    "core.alpha.filters",
+    "core.risk.risk_engine",
+    "core.indicators.pipeline",
 )
 
 
@@ -197,6 +211,41 @@ def named_regime_allowance_fn(allowed_names):
     return _allowance
 
 
+def build_pipeline(
+    strategy_fn=identity_strategy_fn,
+    voting_fn=None,
+    indicator_pipeline_fn=None,
+    regime_detector=None,
+    regime_allowance_fn=None,
+    alpha_score_fn=None,
+    alpha_grade_fn=None,
+    queue_eligibility_fn=simple_queue_eligibility_fn,
+    stop_loss_fn=None,
+    take_profit_fn=None,
+    position_size_fn=None,
+):
+    default_indicator_pipeline_fn = (
+        lambda df, short_ema, long_ema: make_voting_price_frame()
+    )
+    default_voting_fn = (
+        lambda df, short_ema, long_ema, rsi_threshold, use_volume_filter: default_vote_result()
+    )
+
+    return TradingPipeline(
+        strategy_fn=strategy_fn,
+        voting_fn=voting_fn or default_voting_fn,
+        indicator_pipeline_fn=indicator_pipeline_fn or default_indicator_pipeline_fn,
+        regime_detector=regime_detector or fixed_regime_detector(),
+        regime_allowance_fn=regime_allowance_fn or fixed_regime_allowance_fn(),
+        alpha_score_fn=alpha_score_fn or fixed_alpha_score_fn(),
+        alpha_grade_fn=alpha_grade_fn or fixed_alpha_grade_fn(),
+        queue_eligibility_fn=queue_eligibility_fn,
+        stop_loss_fn=stop_loss_fn or fixed_stop_loss_fn(),
+        take_profit_fn=take_profit_fn or fixed_take_profit_fn(),
+        position_size_fn=position_size_fn or fixed_position_size_fn(),
+    )
+
+
 def build_service(
     market_data_fn=None,
     strategy_fn=identity_strategy_fn,
@@ -213,35 +262,88 @@ def build_service(
     save_results_fn=None,
     save_queue_fn=None,
     ranking_fn=None,
+    pipeline=None,
 ):
     default_market_data_fn = (
         lambda symbol, period, interval, auto_adjust: make_price_frame()
     )
-    default_indicator_pipeline_fn = (
-        lambda df, short_ema, long_ema: make_voting_price_frame()
-    )
-    default_voting_fn = (
-        lambda df, short_ema, long_ema, rsi_threshold, use_volume_filter: default_vote_result()
+
+    pipeline = pipeline or build_pipeline(
+        strategy_fn=strategy_fn,
+        voting_fn=voting_fn,
+        indicator_pipeline_fn=indicator_pipeline_fn,
+        regime_detector=regime_detector,
+        regime_allowance_fn=regime_allowance_fn,
+        alpha_score_fn=alpha_score_fn,
+        alpha_grade_fn=alpha_grade_fn,
+        queue_eligibility_fn=queue_eligibility_fn,
+        stop_loss_fn=stop_loss_fn,
+        take_profit_fn=take_profit_fn,
+        position_size_fn=position_size_fn,
     )
 
     return ScannerService(
         market_data_fn=market_data_fn or default_market_data_fn,
-        strategy_fn=strategy_fn,
-        voting_fn=voting_fn or default_voting_fn,
-        indicator_pipeline_fn=indicator_pipeline_fn or default_indicator_pipeline_fn,
-        regime_detector=regime_detector or fixed_regime_detector(),
-        regime_allowance_fn=regime_allowance_fn or fixed_regime_allowance_fn(),
-        alpha_score_fn=alpha_score_fn or fixed_alpha_score_fn(),
-        alpha_grade_fn=alpha_grade_fn or fixed_alpha_grade_fn(),
-        queue_eligibility_fn=queue_eligibility_fn,
-        stop_loss_fn=stop_loss_fn or fixed_stop_loss_fn(),
-        take_profit_fn=take_profit_fn or fixed_take_profit_fn(),
-        position_size_fn=position_size_fn or fixed_position_size_fn(),
+        pipeline=pipeline,
         save_results_fn=save_results_fn or RecordingSaveResults(),
         save_queue_fn=save_queue_fn or RecordingSaveQueue(),
         ranking_fn=ranking_fn or RecordingRanking(),
         account_balance=100000,
     )
+
+
+def make_decision(symbol="AAPL", **overrides):
+    defaults = dict(
+        symbol=symbol,
+        status="OK",
+        strategy_mode=PipelineScanStrategyMode.SINGLE,
+        strategy_name="EMA Trend",
+        raw_signal="BUY",
+        final_signal="BUY",
+        confidence=80,
+        signal_reason="Trend confirmed",
+        regime="Bull",
+        strategy_allowed=True,
+        regime_reason="EMA Trend is allowed in Bull market.",
+        alpha_score=80,
+        alpha_grade="A",
+        alpha_reasons="Strong alpha",
+        current_price=100.0,
+        rsi=60.0,
+        atr=2.0,
+        trend=True,
+        momentum=True,
+        volume=True,
+        stop_loss=95.0,
+        take_profit=110.0,
+        suggested_shares=10,
+        dollar_risk=100.0,
+        queue_eligible=True,
+    )
+    defaults.update(overrides)
+    return TradingDecision(**defaults)
+
+
+class FakePipeline:
+    """Test double standing in for TradingPipeline, used by the delegation
+    and per-symbol-isolation regression tests below."""
+
+    def __init__(self, per_call=None, decision=None, raises=None):
+        self.received_requests = []
+        self._per_call = per_call
+        self._decision = decision
+        self._raises = raises
+
+    def evaluate(self, request):
+        self.received_requests.append(request)
+
+        if self._per_call is not None:
+            return self._per_call(request)
+
+        if self._raises is not None:
+            raise self._raises
+
+        return self._decision or make_decision(symbol=request.symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +461,113 @@ def test_strategy_generation_exception_produces_controlled_error_outcome():
     outcome = result.outcomes[0]
     assert outcome.status == "ERROR"
     assert outcome.final_signal == "SCAN ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline delegation and per-symbol isolation
+# ---------------------------------------------------------------------------
+
+def test_scan_symbol_delegates_to_trading_pipeline_with_expected_request_fields():
+    pipeline = FakePipeline(per_call=lambda request: make_decision(symbol=request.symbol))
+    service = ScannerService(
+        market_data_fn=lambda symbol, period, interval, auto_adjust: make_price_frame(),
+        pipeline=pipeline,
+        save_results_fn=RecordingSaveResults(),
+        save_queue_fn=RecordingSaveQueue(),
+        ranking_fn=RecordingRanking(),
+        account_balance=55000,
+    )
+    request = ScanRequest(
+        symbols=["AAPL"],
+        strategy_name="RSI Pullback",
+        strategy_mode=ScanStrategyMode.VOTING,
+        short_ema=10,
+        long_ema=30,
+        rsi_threshold=40,
+        use_volume_filter=False,
+        use_regime_filter=False,
+        risk_percent=2.0,
+        atr_multiplier=3.0,
+        reward_risk_ratio=1.5,
+        minimum_alpha_score=60,
+    )
+
+    service.scan(request)
+
+    assert len(pipeline.received_requests) == 1
+    pipeline_request = pipeline.received_requests[0]
+    assert pipeline_request.symbol == "AAPL"
+    assert pipeline_request.strategy_mode == PipelineScanStrategyMode.VOTING
+    assert pipeline_request.strategy_name == "RSI Pullback"
+    assert pipeline_request.short_ema == 10
+    assert pipeline_request.long_ema == 30
+    assert pipeline_request.rsi_threshold == 40
+    assert pipeline_request.use_volume_filter is False
+    assert pipeline_request.use_regime_filter is False
+    assert pipeline_request.account_balance == 55000
+    assert pipeline_request.risk_percent == 2.0
+    assert pipeline_request.atr_multiplier == 3.0
+    assert pipeline_request.reward_risk_ratio == 1.5
+    assert pipeline_request.minimum_alpha_score == 60
+
+
+def test_pipeline_result_is_mapped_into_symbol_scan_outcome():
+    decision = make_decision(
+        symbol="AAPL",
+        final_signal="BUY",
+        confidence=77,
+        alpha_score=91,
+        alpha_grade="A+",
+        stop_loss=88.0,
+        take_profit=120.0,
+        suggested_shares=12,
+        dollar_risk=250.0,
+    )
+    pipeline = FakePipeline(decision=decision)
+    service = ScannerService(
+        market_data_fn=lambda symbol, period, interval, auto_adjust: make_price_frame(),
+        pipeline=pipeline,
+        save_results_fn=RecordingSaveResults(),
+        save_queue_fn=RecordingSaveQueue(),
+        ranking_fn=RecordingRanking(),
+    )
+    request = ScanRequest(symbols=["AAPL"])
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.confidence == 77
+    assert outcome.alpha_score == 91
+    assert outcome.alpha_grade == "A+"
+    assert outcome.stop_loss == 88.0
+    assert outcome.take_profit == 120.0
+    assert outcome.suggested_shares == 12
+    assert outcome.dollar_risk == 250.0
+
+
+def test_pipeline_failure_for_one_symbol_does_not_stop_other_symbols():
+    def flaky_evaluate(request):
+        if request.symbol == "BAD":
+            raise PipelineEvaluationError("boom")
+        return make_decision(symbol=request.symbol)
+
+    pipeline = FakePipeline(per_call=flaky_evaluate)
+    service = ScannerService(
+        market_data_fn=lambda symbol, period, interval, auto_adjust: make_price_frame(),
+        pipeline=pipeline,
+        save_results_fn=RecordingSaveResults(),
+        save_queue_fn=RecordingSaveQueue(),
+        ranking_fn=RecordingRanking(),
+    )
+    request = ScanRequest(symbols=["BAD", "AAPL"])
+
+    result = service.scan(request)
+
+    bad_outcome, good_outcome = result.outcomes
+    assert bad_outcome.status == "ERROR"
+    assert bad_outcome.final_signal == "SCAN ERROR"
+    assert bad_outcome.signal_reason == "boom"
+    assert good_outcome.status == "OK"
 
 
 # ---------------------------------------------------------------------------
@@ -868,7 +1077,7 @@ def test_no_real_external_or_database_calls_occur_in_voting_mode(monkeypatch):
 # Static and isolation guarantees
 # ---------------------------------------------------------------------------
 
-def test_scanner_service_module_has_no_forbidden_imports():
+def _scanner_service_imported_modules():
     module_path = (
         Path(__file__).resolve().parents[2]
         / "core" / "services" / "scanner_service.py"
@@ -883,10 +1092,34 @@ def test_scanner_service_module_has_no_forbidden_imports():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported_modules.append(node.module)
 
+    return imported_modules
+
+
+def test_scanner_service_module_has_no_forbidden_imports():
+    imported_modules = _scanner_service_imported_modules()
+
     for module_name in imported_modules:
         assert not module_name.startswith(FORBIDDEN_IMPORT_PREFIXES), (
             f"scanner_service.py must not import '{module_name}'"
         )
+
+
+def test_scanner_service_no_longer_imports_pipeline_collaborators_directly():
+    """ScannerService must delegate decision-workflow collaborators to
+    TradingPipeline instead of importing/invoking them itself."""
+    imported_modules = _scanner_service_imported_modules()
+
+    for module_name in FORBIDDEN_DIRECT_COLLABORATOR_MODULES:
+        assert module_name not in imported_modules, (
+            f"scanner_service.py must not import '{module_name}' directly; "
+            "it must delegate to TradingPipeline instead"
+        )
+
+
+def test_scanner_service_imports_trading_pipeline():
+    imported_modules = _scanner_service_imported_modules()
+
+    assert "core.pipeline.trading_pipeline" in imported_modules
 
 
 def test_no_real_external_or_database_calls_occur(monkeypatch):

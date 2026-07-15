@@ -1,37 +1,24 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Callable, List, Optional
 
 import pandas as pd
 
 from config.settings import settings
-from core.alpha.filters import should_queue_trade
 from core.alpha.ranking import rank_opportunities
-from core.alpha.scoring import calculate_alpha_score, classify_alpha_grade
 from core.execution.trade_queue import save_buy_signals_to_queue
-from core.indicators.pipeline import build_indicator_pipeline
 from core.market_data.yahoo_data import download_price_data
-from core.regime.detector import detect_market_regime
-from core.regime.filters import strategy_allowed
-from core.risk.risk_engine import (
-    calculate_atr_stop_loss,
-    calculate_position_size,
-    calculate_take_profit
+from core.pipeline.models import ScanStrategyMode, TradingPipelineRequest
+from core.pipeline.trading_pipeline import (
+    InsufficientDataError,
+    TradingPipeline,
+    TradingPipelineError
 )
 from core.scanner.scanner_repository import save_scanner_results
-from core.strategy.strategy_engine import generate_strategy_signals
-from core.voting.engine import run_strategy_voting
 
 
 VOTING_STRATEGY_LABEL = "Strategy Voting"
-
-# A voting BUY is only regime-permitted when a strict majority of the
-# strategies that voted BUY would individually be allowed to trade in the
-# detected regime. This reuses the existing single-strategy regime rule
-# (`strategy_allowed`) rather than inventing a new regime formula.
-VOTING_MOMENTUM_CONSENSUS_VOTES = 2
 
 
 class ScannerServiceError(Exception):
@@ -44,11 +31,6 @@ class ScannerPersistenceError(ScannerServiceError):
 
 class TradeQueuePersistenceError(ScannerServiceError):
     """Raised when eligible trades cannot be saved to the trade queue."""
-
-
-class ScanStrategyMode(str, Enum):
-    SINGLE = "single"
-    VOTING = "voting"
 
 
 @dataclass
@@ -194,17 +176,7 @@ class ScannerService:
     def __init__(
         self,
         market_data_fn: Callable = download_price_data,
-        strategy_fn: Callable = generate_strategy_signals,
-        voting_fn: Callable = run_strategy_voting,
-        indicator_pipeline_fn: Callable = build_indicator_pipeline,
-        regime_detector: Callable = detect_market_regime,
-        regime_allowance_fn: Callable = strategy_allowed,
-        alpha_score_fn: Callable = calculate_alpha_score,
-        alpha_grade_fn: Callable = classify_alpha_grade,
-        queue_eligibility_fn: Callable = should_queue_trade,
-        stop_loss_fn: Callable = calculate_atr_stop_loss,
-        take_profit_fn: Callable = calculate_take_profit,
-        position_size_fn: Callable = calculate_position_size,
+        pipeline: Optional[TradingPipeline] = None,
         save_results_fn: Callable = save_scanner_results,
         save_queue_fn: Callable = save_buy_signals_to_queue,
         ranking_fn: Callable = rank_opportunities,
@@ -212,17 +184,7 @@ class ScannerService:
         logger: Optional[logging.Logger] = None,
     ):
         self._market_data_fn = market_data_fn
-        self._strategy_fn = strategy_fn
-        self._voting_fn = voting_fn
-        self._indicator_pipeline_fn = indicator_pipeline_fn
-        self._regime_detector = regime_detector
-        self._regime_allowance_fn = regime_allowance_fn
-        self._alpha_score_fn = alpha_score_fn
-        self._alpha_grade_fn = alpha_grade_fn
-        self._queue_eligibility_fn = queue_eligibility_fn
-        self._stop_loss_fn = stop_loss_fn
-        self._take_profit_fn = take_profit_fn
-        self._position_size_fn = position_size_fn
+        self._pipeline = pipeline or TradingPipeline()
         self._save_results_fn = save_results_fn
         self._save_queue_fn = save_queue_fn
         self._ranking_fn = ranking_fn
@@ -333,10 +295,41 @@ class ScannerService:
                 regime_reason="No data available"
             )
 
-        if request.strategy_mode is ScanStrategyMode.VOTING:
-            return self._scan_symbol_voting(symbol, data, request)
+        pipeline_request = TradingPipelineRequest(
+            symbol=symbol,
+            data=data,
+            strategy_mode=request.strategy_mode,
+            strategy_name=request.strategy_name,
+            short_ema=request.short_ema,
+            long_ema=request.long_ema,
+            rsi_threshold=request.rsi_threshold,
+            use_volume_filter=request.use_volume_filter,
+            use_regime_filter=request.use_regime_filter,
+            account_balance=self._account_balance,
+            risk_percent=request.risk_percent,
+            atr_multiplier=request.atr_multiplier,
+            reward_risk_ratio=request.reward_risk_ratio,
+            minimum_alpha_score=request.minimum_alpha_score,
+        )
 
-        return self._scan_symbol_single(symbol, data, request)
+        try:
+            decision = self._pipeline.evaluate(pipeline_request)
+        except InsufficientDataError as exc:
+            return self._error_outcome(
+                symbol=symbol,
+                strategy=display_strategy,
+                signal_label="NOT ENOUGH DATA",
+                reason=str(exc)
+            )
+        except TradingPipelineError as exc:
+            return self._error_outcome(
+                symbol=symbol,
+                strategy=display_strategy,
+                signal_label="SCAN ERROR",
+                reason=str(exc)
+            )
+
+        return self._outcome_from_decision(symbol, display_strategy, decision)
 
     @staticmethod
     def _display_strategy_name(request: ScanRequest) -> str:
@@ -344,345 +337,41 @@ class ScannerService:
             return VOTING_STRATEGY_LABEL
         return request.strategy_name
 
-    # ------------------------------------------------------------------
-    # Single-strategy path (unchanged behaviour)
-    # ------------------------------------------------------------------
-
-    def _scan_symbol_single(
-        self,
-        symbol: str,
-        data: pd.DataFrame,
-        request: ScanRequest
-    ) -> SymbolScanOutcome:
-        try:
-            data = self._strategy_fn(
-                df=data,
-                strategy_name=request.strategy_name,
-                short_ema=request.short_ema,
-                long_ema=request.long_ema,
-                rsi_threshold=request.rsi_threshold,
-                use_volume_filter=request.use_volume_filter
-            )
-        except Exception:
-            self._logger.exception(
-                "Strategy signal generation failed for %s", symbol
-            )
-            return self._error_outcome(
-                symbol=symbol,
-                strategy=request.strategy_name,
-                signal_label="SCAN ERROR",
-                reason="Strategy signal generation failed."
-            )
-
-        clean_data = data.dropna()
-
-        if clean_data.empty:
-            return self._error_outcome(
-                symbol=symbol,
-                strategy=request.strategy_name,
-                signal_label="NOT ENOUGH DATA",
-                reason="Not enough indicator history"
-            )
-
-        try:
-            market_regime = self._regime_detector(clean_data)
-            is_strategy_allowed = self._regime_allowance_fn(
-                request.strategy_name, market_regime
-            )
-            regime_reason = self._single_regime_reason(
-                request.strategy_name, market_regime, is_strategy_allowed
-            )
-
-            latest = clean_data.iloc[-1]
-            raw_signal = "BUY" if latest["Signal"] == 1 else "NO TRADE"
-            confidence = int(latest.get("Signal Confidence", 0))
-            reason = latest.get("Signal Reason", "No reason available")
-
-            return self._build_success_outcome(
-                symbol=symbol,
-                strategy=request.strategy_name,
-                clean_data=clean_data,
-                alpha_input=latest,
-                raw_signal=raw_signal,
-                confidence=confidence,
-                reason=reason,
-                request=request,
-                is_strategy_allowed=is_strategy_allowed,
-                regime_reason=regime_reason,
-                market_regime=market_regime,
-            )
-        except Exception:
-            self._logger.exception(
-                "Unexpected error while scanning %s", symbol
-            )
-            return self._error_outcome(
-                symbol=symbol,
-                strategy=request.strategy_name,
-                signal_label="SCAN ERROR",
-                reason="Unexpected error during scan."
-            )
-
     @staticmethod
-    def _single_regime_reason(strategy_name, market_regime, is_allowed) -> str:
-        if is_allowed:
-            return (
-                f"{strategy_name} is allowed in {market_regime.value} market."
-            )
-        return f"{strategy_name} is blocked in {market_regime.value} market."
-
-    # ------------------------------------------------------------------
-    # Voting path
-    # ------------------------------------------------------------------
-
-    def _scan_symbol_voting(
-        self,
+    def _outcome_from_decision(
         symbol: str,
-        data: pd.DataFrame,
-        request: ScanRequest
+        display_strategy: str,
+        decision
     ) -> SymbolScanOutcome:
-        try:
-            enriched = self._indicator_pipeline_fn(
-                df=data,
-                short_ema=request.short_ema,
-                long_ema=request.long_ema
-            )
-        except Exception:
-            self._logger.exception(
-                "Indicator enrichment failed for %s", symbol
-            )
-            return self._error_outcome(
-                symbol=symbol,
-                strategy=VOTING_STRATEGY_LABEL,
-                signal_label="SCAN ERROR",
-                reason="Indicator enrichment failed."
-            )
-
-        clean_data = enriched.dropna()
-
-        if clean_data.empty:
-            return self._error_outcome(
-                symbol=symbol,
-                strategy=VOTING_STRATEGY_LABEL,
-                signal_label="NOT ENOUGH DATA",
-                reason="Not enough indicator history"
-            )
-
-        try:
-            vote_result = self._voting_fn(
-                df=data,
-                short_ema=request.short_ema,
-                long_ema=request.long_ema,
-                rsi_threshold=request.rsi_threshold,
-                use_volume_filter=request.use_volume_filter
-            )
-        except Exception:
-            self._logger.exception(
-                "Strategy voting failed for %s", symbol
-            )
-            return self._error_outcome(
-                symbol=symbol,
-                strategy=VOTING_STRATEGY_LABEL,
-                signal_label="SCAN ERROR",
-                reason="Strategy voting failed."
-            )
-
-        try:
-            market_regime = self._regime_detector(clean_data)
-
-            strategy_votes = vote_result.get("strategy_votes", [])
-            buy_voting_strategy_names = [
-                vote["Strategy"]
-                for vote in strategy_votes
-                if vote.get("Signal") == "BUY"
-            ]
-
-            is_strategy_allowed = self._voting_regime_allowed(
-                buy_voting_strategy_names, market_regime
-            )
-            regime_reason = self._voting_regime_reason(
-                buy_voting_strategy_names, market_regime, is_strategy_allowed
-            )
-
-            latest = clean_data.iloc[-1]
-            buy_votes = vote_result.get("buy_votes", 0)
-            alpha_input = self._build_voting_alpha_input(
-                latest, request, buy_votes
-            )
-
-            raw_signal = vote_result.get("final_signal", "NO TRADE")
-            confidence = int(round(vote_result.get("confidence", 0)))
-            reason = vote_result.get("reasons", "No strategy consensus")
-
-            outcome = self._build_success_outcome(
-                symbol=symbol,
-                strategy=VOTING_STRATEGY_LABEL,
-                clean_data=clean_data,
-                alpha_input=alpha_input,
-                raw_signal=raw_signal,
-                confidence=confidence,
-                reason=reason,
-                request=request,
-                is_strategy_allowed=is_strategy_allowed,
-                regime_reason=regime_reason,
-                market_regime=market_regime,
-            )
-
-            outcome.vote_score = vote_result.get("vote_score", 0)
-            outcome.buy_votes = buy_votes
-            outcome.total_votes = vote_result.get("total_votes", 0)
-            outcome.strategy_votes = strategy_votes
-
-            return outcome
-        except Exception:
-            self._logger.exception(
-                "Unexpected error while scanning %s", symbol
-            )
-            return self._error_outcome(
-                symbol=symbol,
-                strategy=VOTING_STRATEGY_LABEL,
-                signal_label="SCAN ERROR",
-                reason="Unexpected error during scan."
-            )
-
-    def _voting_regime_allowed(self, buy_voting_strategy_names, market_regime) -> bool:
-        """A voting BUY is regime-permitted only when a strict majority of
-        the strategies that voted BUY are individually allowed to trade in
-        the detected regime (existing `strategy_allowed` rule, unchanged)."""
-        if not buy_voting_strategy_names:
-            return False
-
-        allowed_count = sum(
-            1
-            for name in buy_voting_strategy_names
-            if self._regime_allowance_fn(name, market_regime)
-        )
-
-        return allowed_count > len(buy_voting_strategy_names) / 2
-
-    @staticmethod
-    def _voting_regime_reason(buy_voting_strategy_names, market_regime, is_allowed) -> str:
-        if not buy_voting_strategy_names:
-            return f"No strategies voted BUY in {market_regime.value} market."
-
-        names = ", ".join(buy_voting_strategy_names)
-
-        if is_allowed:
-            return (
-                f"Majority of BUY-voting strategies ({names}) are allowed "
-                f"in {market_regime.value} market."
-            )
-        return (
-            f"Majority of BUY-voting strategies ({names}) are blocked "
-            f"in {market_regime.value} market."
-        )
-
-    @staticmethod
-    def _build_voting_alpha_input(latest, request: ScanRequest, buy_votes: int) -> dict:
-        """Assembles the row alpha scoring needs from indicator-pipeline
-        output. Uses the same primitives every registered strategy already
-        applies (Short EMA/Long EMA crossover, Volume vs Volume Average) so
-        no new trend/volume rule is introduced. Momentum is approximated by
-        the voting engine's own consensus gate (>=2 BUY votes), since there
-        is no single shared momentum formula across strategies."""
-        alpha_input = latest.to_dict()
-
-        alpha_input["Trend Filter"] = bool(latest["Short EMA"] > latest["Long EMA"])
-        alpha_input["Momentum Filter"] = buy_votes >= VOTING_MOMENTUM_CONSENSUS_VOTES
-
-        if request.use_volume_filter:
-            alpha_input["Volume Filter"] = bool(
-                latest["Volume"] > latest["Volume Average"]
-            )
-        else:
-            alpha_input["Volume Filter"] = True
-
-        return alpha_input
-
-    # ------------------------------------------------------------------
-    # Shared outcome assembly (regime/alpha/risk/queue-eligibility)
-    # ------------------------------------------------------------------
-
-    def _build_success_outcome(
-        self,
-        symbol: str,
-        strategy: str,
-        clean_data: pd.DataFrame,
-        alpha_input,
-        raw_signal: str,
-        confidence: int,
-        reason: str,
-        request: ScanRequest,
-        is_strategy_allowed: bool,
-        regime_reason: str,
-        market_regime,
-    ) -> SymbolScanOutcome:
-        latest = clean_data.iloc[-1]
-
-        price = float(latest["Close"])
-        atr = float(latest["ATR"])
-
-        stop_loss = self._stop_loss_fn(
-            entry_price=price,
-            atr=atr,
-            atr_multiplier=request.atr_multiplier
-        )
-
-        take_profit = self._take_profit_fn(
-            entry_price=price,
-            stop_loss_price=stop_loss,
-            reward_risk_ratio=request.reward_risk_ratio
-        )
-
-        shares, risk_amount = self._position_size_fn(
-            account_balance=self._account_balance,
-            entry_price=price,
-            stop_loss_price=stop_loss,
-            risk_percent=request.risk_percent
-        )
-
-        alpha_score, alpha_reasons = self._alpha_score_fn(alpha_input)
-        alpha_grade = self._alpha_grade_fn(alpha_score)
-
-        queue_allowed_by_alpha = self._queue_eligibility_fn(
-            signal=raw_signal,
-            alpha_score=alpha_score,
-            minimum_score=request.minimum_alpha_score
-        )
-
-        if request.use_regime_filter:
-            final_signal = (
-                "BUY"
-                if queue_allowed_by_alpha and is_strategy_allowed
-                else "NO TRADE"
-            )
-        else:
-            final_signal = "BUY" if queue_allowed_by_alpha else "NO TRADE"
-
         return SymbolScanOutcome(
             symbol=symbol,
             status="OK",
-            strategy=strategy,
-            price=round(price, 2),
-            raw_signal=raw_signal,
-            final_signal=final_signal,
-            confidence=confidence,
-            signal_reason=reason,
-            regime=market_regime.value,
-            regime_reason=regime_reason,
-            alpha_score=alpha_score,
-            alpha_grade=alpha_grade,
-            alpha_reasons=alpha_reasons,
-            rsi=round(float(latest["RSI"]), 2),
-            atr=round(atr, 2),
-            trend_pass=bool(alpha_input.get("Trend Filter", False)),
-            momentum_pass=bool(alpha_input.get("Momentum Filter", False)),
-            volume_pass=bool(alpha_input.get("Volume Filter", False)),
-            regime_allows_strategy=is_strategy_allowed,
-            stop_loss=round(stop_loss, 2),
-            take_profit=round(take_profit, 2),
-            suggested_shares=shares,
-            dollar_risk=round(risk_amount, 2),
-            queue_eligible=(final_signal == "BUY")
+            strategy=display_strategy,
+            price=decision.current_price,
+            raw_signal=decision.raw_signal,
+            final_signal=decision.final_signal,
+            confidence=decision.confidence,
+            signal_reason=decision.signal_reason,
+            regime=decision.regime,
+            regime_reason=decision.regime_reason,
+            alpha_score=decision.alpha_score,
+            alpha_grade=decision.alpha_grade,
+            alpha_reasons=decision.alpha_reasons,
+            rsi=decision.rsi,
+            atr=decision.atr,
+            trend_pass=decision.trend,
+            momentum_pass=decision.momentum,
+            volume_pass=decision.volume,
+            regime_allows_strategy=decision.strategy_allowed,
+            stop_loss=decision.stop_loss,
+            take_profit=decision.take_profit,
+            suggested_shares=decision.suggested_shares,
+            dollar_risk=decision.dollar_risk,
+            queue_eligible=decision.queue_eligible,
+            vote_score=decision.vote_score,
+            buy_votes=decision.buy_votes,
+            total_votes=decision.total_votes,
+            strategy_votes=decision.strategy_votes,
         )
 
     def _error_outcome(
