@@ -37,7 +37,7 @@ def make_context(mode):
 
 @pytest.mark.parametrize(
     "mode",
-    [RuntimeMode.RESEARCH, RuntimeMode.PAPER],
+    [RuntimeMode.RESEARCH],
 )
 def test_route_returns_not_implemented_result_for_placeholder_modes(mode):
     router = RuntimeRouter()
@@ -103,6 +103,30 @@ def test_route_backtest_mode_delegates_to_backtest_runtime(monkeypatch):
 
     router = RuntimeRouter()
     context = make_context(RuntimeMode.BACKTEST)
+
+    result = router.route(context)
+
+    assert len(calls) == 1
+    assert calls[0] is context
+    assert result.status == "completed"
+
+
+def test_route_paper_mode_delegates_to_paper_runtime(monkeypatch):
+    """PAPER must no longer be a placeholder: routing it should call the
+    dedicated paper-runtime coordinator rather than RuntimeRouter itself
+    implementing paper-trading logic."""
+    import core.runtime.paper_runtime as paper_runtime
+
+    calls = []
+
+    def fake_run_paper_trading(context):
+        calls.append(context)
+        return RuntimeResult(mode=RuntimeMode.PAPER, status="completed", message="ok")
+
+    monkeypatch.setattr(paper_runtime, "run_paper_trading", fake_run_paper_trading)
+
+    router = RuntimeRouter()
+    context = make_context(RuntimeMode.PAPER)
 
     result = router.route(context)
 

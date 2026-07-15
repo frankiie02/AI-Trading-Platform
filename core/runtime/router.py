@@ -6,7 +6,6 @@ from core.runtime.modes import RuntimeMode
 
 _NOT_YET_IMPLEMENTED_MODES = (
     RuntimeMode.RESEARCH,
-    RuntimeMode.PAPER,
 )
 
 
@@ -54,6 +53,14 @@ class RuntimeRouter:
             from core.runtime.backtest_runtime import run_backtest
 
             return run_backtest(context)
+
+        if mode is RuntimeMode.PAPER:
+            # Imported lazily for the same reason as the scanner/backtest
+            # runtimes above - keeps RuntimeRouter's own imports free of
+            # execution/database dependencies.
+            from core.runtime.paper_runtime import run_paper_trading
+
+            return run_paper_trading(context)
 
         if mode in _NOT_YET_IMPLEMENTED_MODES:
             context.logger.info(

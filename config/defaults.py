@@ -77,6 +77,25 @@ DEFAULT_SETTINGS = {
     "BACKTEST_COMMISSION": 0.0,
     "BACKTEST_SLIPPAGE": 0.0,
 
+    # Standalone paper runtime (core/runtime/paper_runtime.py) and the
+    # Paper Trading / Order Management / Portfolio / Trade History
+    # Streamlit pages, all of which call PaperTradingService. Kept separate
+    # from DEFAULT_*/SCANNER_*/BACKTEST_* settings so the unattended
+    # runtime has its own safe, conservative configuration. Automatic
+    # trade-queue processing defaults to False: nothing executes without
+    # an explicit opt-in.
+    "PAPER_ACCOUNT_ID": "default",
+    "PAPER_STARTING_BALANCE": 100000,
+    "PAPER_COMMISSION": 0.0,
+    "PAPER_SLIPPAGE": 0.0,
+    "PAPER_MAX_OPEN_POSITIONS": 10,
+    "PAPER_MAX_POSITION_PERCENT": 25.0,
+    "PAPER_PROCESS_QUEUE": False,
+    "PAPER_ALLOW_MANUAL_CLOSE": True,
+    "PAPER_PRICE_SOURCE": "queue",
+    "PAPER_REQUIRE_STOP_LOSS": False,
+    "PAPER_REQUIRE_TAKE_PROFIT": False,
+
     "DATABASE_PATH": "data/trading_platform.db",
 
     "IBKR_HOST": "127.0.0.1",

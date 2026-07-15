@@ -1,46 +1,141 @@
+import pandas as pd
 import streamlit as st
 
 from config.settings import settings
-from core.execution.paper_trader import PaperTrader
 from core.market_data.yahoo_data import download_price_data
-from core.portfolio.position_monitor import refresh_paper_position_prices
+from core.services.paper_trading_service import (
+    ExitReason,
+    InvalidOrderStateTransitionError,
+    InvalidPaperOrderError,
+    OrderStatus,
+    PaperTradingService,
+    PaperTradingServiceError,
+    PositionNotFoundError,
+)
 
 st.set_page_config(page_title="Order Management", layout="wide")
 
 st.title("Order Management")
 
 st.write(
-    "Manage open paper positions: close full or partial positions, "
-    "move stop-loss, update take-profit, set break-even, and set trailing stop."
+    "Manage paper orders and open positions: cancel orders still in a "
+    "cancellable state, close full or partial positions, and update "
+    "stop-loss/take-profit levels. All actions go through PaperTradingService "
+    "- no direct database access happens on this page."
 )
 
-trader = PaperTrader(
-    starting_balance=settings.STARTING_BALANCE
+service = PaperTradingService(
+    starting_balance=settings.STARTING_BALANCE,
+    commission=settings.PAPER_COMMISSION,
+    slippage_percent=settings.PAPER_SLIPPAGE,
+    max_open_positions=settings.PAPER_MAX_OPEN_POSITIONS,
+    max_position_percent=settings.PAPER_MAX_POSITION_PERCENT,
+    require_stop_loss=settings.PAPER_REQUIRE_STOP_LOSS,
+    require_take_profit=settings.PAPER_REQUIRE_TAKE_PROFIT,
 )
 
-refresh = st.button("Refresh Position Prices")
+_CANCELLABLE = {OrderStatus.CREATED.value, OrderStatus.VALIDATED.value, OrderStatus.SUBMITTED.value}
 
-if refresh:
-    success, message = refresh_paper_position_prices(
-        starting_balance=settings.STARTING_BALANCE
+st.subheader("Orders")
+
+orders = service.get_orders()
+
+if not orders:
+    st.info("No orders yet.")
+else:
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "Order ID": o.order_id,
+                "Symbol": o.symbol,
+                "Side": o.side,
+                "Quantity": o.quantity,
+                "Status": o.status,
+                "Requested Price": o.requested_price,
+                "Fill Price": o.fill_price,
+                "Rejection Reason": o.rejection_reason,
+                "Fees": o.fees,
+                "Updated At": o.updated_at,
+            }
+            for o in orders
+        ]),
+        use_container_width=True,
+        hide_index=True
     )
 
-    if success:
-        st.success(message)
+    reviewable_orders = [o for o in orders if o.status in _CANCELLABLE]
+
+    if reviewable_orders:
+        st.divider()
+        st.subheader("Review Held Orders")
+
+        order_lookup = {
+            f"#{o.order_id} {o.symbol} ({o.status})": o.order_id for o in reviewable_orders
+        }
+
+        selected_label = st.selectbox("Order", list(order_lookup.keys()))
+        selected_order_id = order_lookup[selected_label]
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            fill_now = st.button("Fill Now")
+
+        with col_b:
+            cancel_now = st.button("Cancel Order")
+
+        if fill_now:
+            try:
+                order = next(o for o in reviewable_orders if o.order_id == selected_order_id)
+
+                if order.status == OrderStatus.VALIDATED.value:
+                    service.submit_order(selected_order_id)
+
+                service.fill_order(selected_order_id)
+            except (InvalidOrderStateTransitionError, InvalidPaperOrderError) as error:
+                st.error(str(error))
+            except PaperTradingServiceError as error:
+                st.error(f"Order could not be filled: {error}")
+            else:
+                st.success(f"Order #{selected_order_id} filled.")
+                st.rerun()
+
+        if cancel_now:
+            try:
+                service.cancel_order(selected_order_id)
+            except InvalidOrderStateTransitionError as error:
+                st.error(str(error))
+            except PaperTradingServiceError as error:
+                st.error(f"Order could not be cancelled: {error}")
+            else:
+                st.success(f"Order #{selected_order_id} cancelled.")
+                st.rerun()
     else:
-        st.warning(message)
+        st.info("No orders are currently held for review.")
 
-    st.rerun()
-
-positions = trader.get_positions()
+st.divider()
 
 st.subheader("Open Positions")
 
-if positions.empty:
+positions = service.get_positions()
+
+if not positions:
     st.info("No open positions to manage.")
 else:
     st.dataframe(
-        positions,
+        pd.DataFrame([
+            {
+                "Symbol": p.symbol,
+                "Shares": p.quantity,
+                "Entry Price": p.average_entry_price,
+                "Current Price": p.current_price,
+                "Stop Loss": p.stop_loss,
+                "Take Profit": p.take_profit,
+                "Unrealised PnL": p.unrealised_pnl,
+                "Realised PnL": p.realised_pnl,
+            }
+            for p in positions
+        ]),
         use_container_width=True,
         hide_index=True
     )
@@ -49,31 +144,15 @@ else:
 
     st.subheader("Select Position")
 
-    symbols = positions["Symbol"].tolist()
-
-    selected_symbol = st.selectbox(
-        "Position",
-        symbols
-    )
-
-    selected_position = positions[
-        positions["Symbol"] == selected_symbol
-    ].iloc[0]
-
-    shares_held = int(selected_position["Shares"])
-    entry_price = float(selected_position["Entry Price"])
-    current_price = float(selected_position["Current Price"])
-
-    current_stop_loss = selected_position["Stop Loss"]
-    current_take_profit = selected_position["Take Profit"]
-    current_trailing_stop = selected_position["Trailing Stop"]
+    symbols = [p.symbol for p in positions]
+    selected_symbol = st.selectbox("Position", symbols)
+    selected_position = next(p for p in positions if p.symbol == selected_symbol)
 
     c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("Symbol", selected_symbol)
-    c2.metric("Shares Held", shares_held)
-    c3.metric("Entry Price", f"${entry_price:,.2f}")
-    c4.metric("Current Price", f"${current_price:,.2f}")
+    c1.metric("Symbol", selected_position.symbol)
+    c2.metric("Shares Held", selected_position.quantity)
+    c3.metric("Entry Price", f"${selected_position.average_entry_price:,.2f}")
+    c4.metric("Current Price", f"${selected_position.current_price:,.2f}")
 
     st.divider()
 
@@ -82,8 +161,8 @@ else:
     close_shares = st.number_input(
         "Shares to close",
         min_value=1,
-        max_value=shares_held,
-        value=shares_held,
+        max_value=int(selected_position.quantity),
+        value=int(selected_position.quantity),
         step=1
     )
 
@@ -95,26 +174,20 @@ else:
     manual_close_price = st.number_input(
         "Manual Close Price",
         min_value=0.01,
-        value=float(current_price),
+        value=float(selected_position.current_price),
         step=0.01
     )
 
-    close_price = current_price
+    close_price = selected_position.current_price
 
     if price_mode == "Latest Market Price":
-        data = download_price_data(
-            symbol=selected_symbol,
-            period="5d",
-            interval="1d",
-            auto_adjust=True
-        )
+        data = download_price_data(symbol=selected_symbol, period="5d", interval="1d", auto_adjust=True)
 
         if data.empty:
             st.warning("Could not fetch latest market price. Using stored price.")
         else:
             close_price = float(data["Close"].iloc[-1])
             st.info(f"Latest price for {selected_symbol}: ${close_price:,.2f}")
-
     elif price_mode == "Manual Price":
         close_price = manual_close_price
 
@@ -126,107 +199,47 @@ else:
     with col_b:
         close_full = st.button("Close Full Position")
 
-    if close_partial:
-        success, message = trader.sell(
-            symbol=selected_symbol,
-            shares=close_shares,
-            price=close_price
-        )
+    if close_partial or close_full:
+        quantity = int(selected_position.quantity) if close_full else int(close_shares)
 
-        if success:
-            st.success(message)
+        try:
+            trade = service.close_position(
+                selected_symbol, quantity=quantity, price=close_price, reason=ExitReason.MANUAL
+            )
+        except (PositionNotFoundError, InvalidPaperOrderError) as error:
+            st.error(str(error))
+        except PaperTradingServiceError as error:
+            st.error(f"Position could not be closed: {error}")
         else:
-            st.error(message)
-
-        st.rerun()
-
-    if close_full:
-        success, message = trader.sell(
-            symbol=selected_symbol,
-            shares=shares_held,
-            price=close_price
-        )
-
-        if success:
-            st.success(message)
-        else:
-            st.error(message)
-
-        st.rerun()
+            st.success(
+                f"Closed {trade.quantity} {trade.symbol} @ ${trade.exit_price:,.2f} "
+                f"(net P/L ${trade.net_pnl:,.2f})."
+            )
+            st.rerun()
 
     st.divider()
 
-    st.subheader("Update Order Levels")
+    st.subheader("Update Stop Loss / Take Profit")
 
-    stop_loss_value = (
-        float(current_stop_loss)
-        if current_stop_loss is not None and str(current_stop_loss) != "nan"
-        else 0.0
-    )
+    stop_loss_value = float(selected_position.stop_loss) if selected_position.stop_loss else 0.0
+    take_profit_value = float(selected_position.take_profit) if selected_position.take_profit else 0.0
 
-    take_profit_value = (
-        float(current_take_profit)
-        if current_take_profit is not None and str(current_take_profit) != "nan"
-        else 0.0
-    )
-
-    trailing_stop_value = (
-        float(current_trailing_stop)
-        if current_trailing_stop is not None and str(current_trailing_stop) != "nan"
-        else 0.0
-    )
-
-    new_stop_loss = st.number_input(
-        "Stop Loss",
-        min_value=0.0,
-        value=stop_loss_value,
-        step=0.01
-    )
-
-    new_take_profit = st.number_input(
-        "Take Profit",
-        min_value=0.0,
-        value=take_profit_value,
-        step=0.01
-    )
-
-    new_trailing_stop = st.number_input(
-        "Trailing Stop",
-        min_value=0.0,
-        value=trailing_stop_value,
-        step=0.01
-    )
+    new_stop_loss = st.number_input("Stop Loss", min_value=0.0, value=stop_loss_value, step=0.01)
+    new_take_profit = st.number_input("Take Profit", min_value=0.0, value=take_profit_value, step=0.01)
 
     update_levels = st.button("Save Order Levels")
-    break_even = st.button("Move Stop Loss to Break-Even")
 
     if update_levels:
-        stop_loss_to_save = new_stop_loss if new_stop_loss > 0 else None
-        take_profit_to_save = new_take_profit if new_take_profit > 0 else None
-        trailing_stop_to_save = new_trailing_stop if new_trailing_stop > 0 else None
-
-        success, message = trader.update_position_levels(
-            symbol=selected_symbol,
-            stop_loss=stop_loss_to_save,
-            take_profit=take_profit_to_save,
-            trailing_stop=trailing_stop_to_save
-        )
-
-        if success:
-            st.success(message)
+        try:
+            service.update_position_levels(
+                selected_symbol,
+                stop_loss=new_stop_loss if new_stop_loss > 0 else None,
+                take_profit=new_take_profit if new_take_profit > 0 else None,
+            )
+        except PositionNotFoundError as error:
+            st.error(str(error))
+        except PaperTradingServiceError as error:
+            st.error(f"Levels could not be updated: {error}")
         else:
-            st.error(message)
-
-        st.rerun()
-
-    if break_even:
-        success, message = trader.set_break_even(
-            symbol=selected_symbol
-        )
-
-        if success:
-            st.success(message)
-        else:
-            st.error(message)
-
-        st.rerun()
+            st.success(f"Updated order levels for {selected_symbol}.")
+            st.rerun()

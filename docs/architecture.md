@@ -24,7 +24,7 @@ Market Data → Indicators → Strategy Engine → Regime Engine → Alpha Engin
 - `core/database`: SQLite database layer.
 - `core/runtime`: minimal application bootstrap and runtime-mode routing (see below).
 - `core/services`: reusable, Streamlit-free orchestration services for dashboard workflows (see below).
-- `core/pipeline`: the shared `TradingPipeline` decision workflow used by `ScannerService` and `BacktestService` (and, in a future milestone, `PaperTradingService`/`LiveTradingService`) (see below).
+- `core/pipeline`: the shared `TradingPipeline` decision workflow used by `ScannerService`, `BacktestService`, and `PaperTradingService` (and, in a future milestone, `LiveTradingService`) (see below).
 
 ## Runtime Bootstrap
 
@@ -45,8 +45,10 @@ Runtime mode is selected via the `RUNTIME_MODE` configuration key (`config/defau
 
 `RuntimeRouter` (`core/runtime/router.py`) dispatches the resolved mode. It contains no trading logic itself:
 
-- `research`, `backtest`, `paper`: recognised, but their standalone runtime services are not yet implemented — the router returns a controlled `RuntimeResult` describing this.
+- `research`: recognised, but its standalone runtime service is not yet implemented — the router returns a controlled `RuntimeResult` describing this.
 - `scanner`: dispatches to the standalone scanner runtime (`core/runtime/scanner_runtime.py`, see below), imported lazily inside `route()` so the router's own module-level imports stay free of scanner/market-data/database dependencies.
+- `backtest`: dispatches to the standalone backtest runtime (`core/runtime/backtest_runtime.py`, see below), imported lazily for the same reason.
+- `paper`: dispatches to the standalone paper runtime (`core/runtime/paper_runtime.py`, see below), imported lazily for the same reason.
 - `optimisation`: raises `UnsupportedRuntimeModeError` (not implemented yet).
 - `live`: always raises `LiveModeDisabledError`. Live trading is hard-disabled and is not activated by this bootstrap.
 
@@ -69,7 +71,7 @@ It is a pure decision workflow with **no** market-data downloading, Streamlit re
   - Voting cannot bypass regime, alpha, or risk controls — the same `use_regime_filter` / `minimum_alpha_score` / risk-calculation gates apply to both paths.
 - Every collaborator (strategy generation, voting, indicator pipeline, regime detection/filter, alpha scoring/grading, queue-eligibility, stop-loss/take-profit/position-size) is injected via constructor defaults (no DI framework), so `TradingPipeline` contains no Streamlit, database, or broker code and can be tested with fakes.
 - `TradingPipeline` performs no persistence and no broker side effects. Live trading remains disabled regardless of pipeline output — nothing in `TradingPipeline` submits orders.
-- Reuse plan: `BacktestService` now builds a `TradingPipelineRequest` per historical bar and calls `TradingPipeline.evaluate()`, exactly as `ScannerService` does per symbol. `PaperTradingService` and a future `LiveTradingService` are expected to do the same, so the indicator → strategy/voting → regime → alpha → risk decision logic remains implemented exactly once across every consumer.
+- Reuse plan: `BacktestService` builds a `TradingPipelineRequest` per historical bar and calls `TradingPipeline.evaluate()`, exactly as `ScannerService` does per symbol. `PaperTradingService` (see "Paper Trading Service" below) consumes the `TradingDecision` those two produce (or a queued/manual signal) rather than calling `TradingPipeline.evaluate()` itself, so the indicator → strategy/voting → regime → alpha → risk decision logic remains implemented exactly once, upstream of every execution path. A future `LiveTradingService` is expected to consume `TradingDecision` the same way.
 
 ## Backtest Service
 
@@ -185,3 +187,64 @@ Key points:
 These are intentionally separate from the interactive-dashboard defaults (`DEFAULT_SYMBOLS`, `DEFAULT_STRATEGY`, etc.) so the unattended standalone runtime uses its own small, safe symbol set and never queues trades unless explicitly configured to, without changing the Streamlit page's widget defaults.
 
 Live trading remains disabled: `RuntimeMode.LIVE` always raises `LiveModeDisabledError` regardless of scanner configuration, and nothing in the scanner runtime or `ScannerService` submits broker orders.
+
+## Paper Trading Service
+
+`PaperTradingService` (`core/services/paper_trading_service.py`) is the reusable, testable paper-trading workflow, used by `pages/2_Portfolio.py`, `pages/4_Paper_Trading.py`, `pages/6_Order_Management.py`, `pages/3_Trade_History.py`, and the standalone `paper` runtime mode:
+
+```text
+TradingDecision (from TradingPipeline, or a queued signal / manual page entry)
+    → order validation (quantity, cash, position/open-position limits, stop/target requirements)
+    → CREATED → VALIDATED → SUBMITTED → FILLED (or REJECTED/CANCELLED/EXPIRED)
+    → atomic fill (cash debit, position upsert, fill/trade record, order status)
+    → stop-loss / take-profit exits, manual closes → realised P&L, trade history
+    → reconciliation
+```
+
+Key points:
+
+- **Consumes `TradingDecision`, never generates one.** `PaperTradingService` does not call `TradingPipeline`, download market data, or evaluate strategies/regime/alpha/risk itself - it only acts on an already-produced `TradingDecision` (`final_signal == "BUY"`) or a queued `trade_queue` row, exactly the boundary `TradingPipeline`'s own docstring anticipated. This is enforced by an AST-based import-boundary test forbidding direct imports of `core.strategy`, `core.voting`, `core.regime`, `core.alpha`, `core.risk`, `core.indicators`, `core.market_data`, and `core.pipeline.trading_pipeline`.
+- **Order lifecycle**: `CREATED → VALIDATED → SUBMITTED → FILLED`, with `REJECTED`/`CANCELLED`/`EXPIRED` as terminal alternatives. By default `create_order_from_decision()`/`process_queue()` walk an order straight through to `FILLED` in one call (`auto_fill=True`); passing `auto_fill=False` stops at `VALIDATED` so a user can review it on the Order Management page before an explicit `submit_order()`/`fill_order()` (or `cancel_order()`). Invalid transitions (e.g. `REJECTED → FILLED`, `FILLED → CREATED`, `CANCELLED → SUBMITTED`) raise `InvalidOrderStateTransitionError`. Partial fills are not supported: an order's quantity is capped (by available cash and `PAPER_MAX_POSITION_PERCENT`) once, at validation time, then either fills in full or is rejected before submission.
+- **Fill convention** (mirrors `BacktestService`'s adverse-slippage/commission convention, adapted for interactive rather than bar-by-bar use): a BUY fills at `reference_price * (1 + PAPER_SLIPPAGE / 100)`; an exit fills at `reference_price * (1 - PAPER_SLIPPAGE / 100)`. `reference_price` is always caller-supplied (the `TradingDecision.current_price`, the queued signal's price, or a page/runtime-injected quote) - `PaperTradingService` never downloads market data itself. A flat `PAPER_COMMISSION` is charged per fill (once on entry, once on exit).
+- **Position management**: one open position per symbol (adding to an existing position averages the entry price, matching the legacy `PaperTrader`'s convention); long-only, no leverage, no short selling. `update_positions()` marks positions to a caller-supplied price map; `check_exits()` evaluates stop-loss before take-profit (adverse-first) against that same price map - interactive paper trading only ever receives one current price per update (no OHLC bar), so this differs from `BacktestService`'s true same-bar intrabar collision detection, but preserves the same "adverse condition checked first" intent.
+- **Persistence and atomicity**: reuses the existing `account_state`/`paper_positions`/`paper_trades`/`trade_queue` tables (extended with additive columns) plus two new tables, `paper_orders` (the order lifecycle) and `paper_audit_events` (an audit trail) - see `docs/database.md`. Every fill (cash debit/credit, position upsert/delete, trade-ledger row, order-status update) happens inside one transaction in `core/execution/paper_orders_repository.py`, with a rollback on any failure; this is an approved correctness fix relative to the legacy `PaperTrader.buy()`/`sell()`, which is left completely untouched and spans two separate connections/commits with no rollback path.
+- **Reconciliation**: `reconcile()` checks `account_state.realised_pnl` against `SUM(paper_trades.net_pnl)`, flags negative cash, and flags non-positive position share counts, returning explicit differences rather than silently overwriting state.
+- **Error hierarchy**: `PaperTradingServiceError` → `InvalidPaperOrderError`, `InvalidOrderStateTransitionError`, `InsufficientCashError`, `PositionNotFoundError`, `PaperTradingPersistenceError`, `ReconciliationError` - the same one-base-plus-specific-subclasses convention as `ScannerServiceError`/`BacktestServiceError`.
+- **No broker path**: `PaperTradingService` never imports `core.broker` or `ib_insync`, never uses real credentials, and never submits a real order (see `docs/broker.md`).
+
+### Known limitations / deferred work
+
+- `pages/5_Trade_Queue.py` still executes trades through the legacy `ExecutionRouter`/`PaperTrader` path, not `PaperTradingService` - both paths can mutate the same `paper_positions`/`account_state` rows. Migrating that page is deliberately deferred (see `docs/roadmap.md`).
+- Trailing-stop is not part of `PaperPosition`/`PaperTradingService` - `paper_positions.trailing_stop` remains a legacy-`PaperTrader`-only column.
+- `reserved_cash` exists on `PaperAccount`/`account_state` for forward compatibility but is always `0` in this milestone; nothing yet holds cash aside for a not-yet-filled order.
+- Partial order fills are explicitly deferred, not faked: an order either fills in full (at a cash/position-limit-capped quantity) or is rejected before submission.
+
+## Standalone Paper Runtime
+
+`core/runtime/paper_runtime.py` provides `run_paper_trading(context, service=None, price_fetch_fn=None)`, the standalone coordinator for `RuntimeMode.PAPER`, following the same shape as `run_scanner`/`run_backtest`:
+
+1. `build_paper_settings(context.settings)` builds `PaperTradingService` constructor kwargs (plus a `process_queue` flag) from the `PAPER_*` settings (`config/defaults.py`), falling back to their defaults for any key absent from `context.settings`.
+2. Optionally refreshes open-position prices/exits through an injected `price_fetch_fn(symbol) -> float` - if none is supplied (the default), position marking/exit-checking is skipped and no market data is downloaded implicitly; only queue processing runs.
+3. Calls `PaperTradingService.process_queue()` (a real `PaperTradingService()` by default - paper/local only, no broker), gated by `PAPER_PROCESS_QUEUE`, which **defaults to `False`**: nothing executes automatically unless explicitly enabled.
+4. Returns a `RuntimeResult` with a concise terminal summary (cash, equity, open positions, orders filled/rejected, realised/unrealised P&L).
+5. Performs no Streamlit rendering and imports no broker/live-execution module.
+
+`RuntimeRouter` now dispatches `RuntimeMode.PAPER` to it (imported lazily inside `route()`, matching the scanner/backtest dispatch pattern) instead of returning a placeholder "not implemented" result; `research` remains a placeholder.
+
+### Paper runtime configuration keys (`config/defaults.py`)
+
+| Key | Default |
+|---|---|
+| `PAPER_ACCOUNT_ID` | `"default"` |
+| `PAPER_STARTING_BALANCE` | `100000` |
+| `PAPER_COMMISSION` | `0.0` |
+| `PAPER_SLIPPAGE` | `0.0` |
+| `PAPER_MAX_OPEN_POSITIONS` | `10` |
+| `PAPER_MAX_POSITION_PERCENT` | `25.0` |
+| `PAPER_PROCESS_QUEUE` | `False` |
+| `PAPER_ALLOW_MANUAL_CLOSE` | `True` |
+| `PAPER_PRICE_SOURCE` | `"queue"` |
+| `PAPER_REQUIRE_STOP_LOSS` | `False` |
+| `PAPER_REQUIRE_TAKE_PROFIT` | `False` |
+
+Live trading remains disabled: `RuntimeMode.LIVE` always raises `LiveModeDisabledError` regardless of paper configuration, and nothing in the paper runtime or `PaperTradingService` submits broker orders.
