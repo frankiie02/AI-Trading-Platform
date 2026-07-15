@@ -6,7 +6,6 @@ from core.runtime.modes import RuntimeMode
 
 _NOT_YET_IMPLEMENTED_MODES = (
     RuntimeMode.RESEARCH,
-    RuntimeMode.SCANNER,
     RuntimeMode.BACKTEST,
     RuntimeMode.PAPER,
 )
@@ -40,6 +39,14 @@ class RuntimeRouter:
             raise UnsupportedRuntimeModeError(
                 "Optimisation runtime is not implemented yet."
             )
+
+        if mode is RuntimeMode.SCANNER:
+            # Imported lazily so RuntimeRouter's own module-level import
+            # surface stays free of scanner/market-data/database
+            # dependencies, matching this class's "no trading logic" intent.
+            from core.runtime.scanner_runtime import run_scanner
+
+            return run_scanner(context)
 
         if mode in _NOT_YET_IMPLEMENTED_MODES:
             context.logger.info(

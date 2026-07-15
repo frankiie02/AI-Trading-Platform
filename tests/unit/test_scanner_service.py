@@ -9,17 +9,22 @@ from core.services.scanner_service import (
     ScanRequest,
     ScannerPersistenceError,
     ScannerService,
+    ScanStrategyMode,
     SymbolScanOutcome,
     TradeQueuePersistenceError,
 )
 
+# NOTE: core.voting was forbidden here in Stage 1, when voting was
+# explicitly deferred. This scanner milestone requires ScannerService to
+# invoke the voting engine directly (Part 3), so that restriction no longer
+# applies; the remaining prefixes (Streamlit/dashboard/broker/runtime/live
+# broker SDK) are unaffected and still forbidden.
 FORBIDDEN_IMPORT_PREFIXES = (
     "streamlit",
     "pages",
     "dashboard",
     "core.broker",
     "core.runtime",
-    "core.voting",
     "ib_insync",
 )
 
@@ -147,9 +152,56 @@ class RecordingRanking:
         return pd.DataFrame(results)
 
 
+def make_voting_price_frame(
+    close=100.0,
+    atr=2.0,
+    rsi=60.0,
+    short_ema=25.0,
+    long_ema=20.0,
+    volume=2_000_000,
+    volume_average=1_000_000,
+):
+    """Mimics the output of build_indicator_pipeline for voting-mode tests."""
+    return pd.DataFrame({
+        "Close": [close],
+        "ATR": [atr],
+        "RSI": [rsi],
+        "Short EMA": [short_ema],
+        "Long EMA": [long_ema],
+        "Volume": [volume],
+        "Volume Average": [volume_average],
+    })
+
+
+def default_vote_result():
+    return {
+        "final_signal": "BUY",
+        "vote_score": 75.0,
+        "buy_votes": 3,
+        "total_votes": 4,
+        "confidence": 78.5,
+        "reasons": "EMA Trend: Trend confirmed | MACD Momentum: Momentum confirmed",
+        "strategy_votes": [
+            {"Strategy": "EMA Trend", "Signal": "BUY", "Confidence": 80, "Reason": "Trend confirmed"},
+            {"Strategy": "MACD Momentum", "Signal": "BUY", "Confidence": 82, "Reason": "Momentum confirmed"},
+            {"Strategy": "Breakout", "Signal": "BUY", "Confidence": 85, "Reason": "Breakout confirmed"},
+            {"Strategy": "RSI Pullback", "Signal": "NO TRADE", "Confidence": 0, "Reason": "No trade"},
+        ],
+    }
+
+
+def named_regime_allowance_fn(allowed_names):
+    def _allowance(strategy_name, regime):
+        return strategy_name in allowed_names
+
+    return _allowance
+
+
 def build_service(
     market_data_fn=None,
     strategy_fn=identity_strategy_fn,
+    voting_fn=None,
+    indicator_pipeline_fn=None,
     regime_detector=None,
     regime_allowance_fn=None,
     alpha_score_fn=None,
@@ -165,10 +217,18 @@ def build_service(
     default_market_data_fn = (
         lambda symbol, period, interval, auto_adjust: make_price_frame()
     )
+    default_indicator_pipeline_fn = (
+        lambda df, short_ema, long_ema: make_voting_price_frame()
+    )
+    default_voting_fn = (
+        lambda df, short_ema, long_ema, rsi_threshold, use_volume_filter: default_vote_result()
+    )
 
     return ScannerService(
         market_data_fn=market_data_fn or default_market_data_fn,
         strategy_fn=strategy_fn,
+        voting_fn=voting_fn or default_voting_fn,
+        indicator_pipeline_fn=indicator_pipeline_fn or default_indicator_pipeline_fn,
         regime_detector=regime_detector or fixed_regime_detector(),
         regime_allowance_fn=regime_allowance_fn or fixed_regime_allowance_fn(),
         alpha_score_fn=alpha_score_fn or fixed_alpha_score_fn(),
@@ -498,6 +558,310 @@ def test_trade_queue_failure_raises_controlled_service_exception_after_persisten
         service.scan(request)
 
     assert len(save_results.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Voting mode
+# ---------------------------------------------------------------------------
+
+def test_scan_request_defaults_to_single_strategy_mode():
+    request = ScanRequest(symbols=["AAPL"])
+
+    assert request.strategy_mode == ScanStrategyMode.SINGLE
+
+
+def test_scan_request_accepts_raw_string_strategy_mode():
+    request = ScanRequest(symbols=["AAPL"], strategy_mode="voting")
+
+    assert request.strategy_mode == ScanStrategyMode.VOTING
+
+
+def test_voting_mode_calls_voting_collaborator_and_not_single_strategy_fn():
+    calls = {"voting": 0, "single": 0}
+
+    def voting_fn(df, short_ema, long_ema, rsi_threshold, use_volume_filter):
+        calls["voting"] += 1
+        return {
+            "final_signal": "NO TRADE",
+            "vote_score": 0,
+            "buy_votes": 0,
+            "total_votes": 4,
+            "confidence": 0,
+            "reasons": "No consensus",
+            "strategy_votes": [],
+        }
+
+    def single_strategy_fn(df, strategy_name, short_ema, long_ema, rsi_threshold, use_volume_filter):
+        calls["single"] += 1
+        return df
+
+    service = build_service(strategy_fn=single_strategy_fn, voting_fn=voting_fn)
+    request = ScanRequest(symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING)
+
+    service.scan(request)
+
+    assert calls["voting"] == 1
+    assert calls["single"] == 0
+
+
+def test_voting_outcome_uses_voting_display_label():
+    service = build_service()
+    request = ScanRequest(symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING)
+
+    result = service.scan(request)
+
+    assert result.outcomes[0].strategy == "Strategy Voting"
+
+
+def test_voting_confidence_and_reasons_preserved():
+    def voting_fn(df, short_ema, long_ema, rsi_threshold, use_volume_filter):
+        return {
+            "final_signal": "BUY",
+            "vote_score": 66.67,
+            "buy_votes": 2,
+            "total_votes": 3,
+            "confidence": 71.4,
+            "reasons": "EMA Trend: bullish | Breakout: confirmed",
+            "strategy_votes": [
+                {"Strategy": "EMA Trend", "Signal": "BUY", "Confidence": 80, "Reason": "bullish"},
+                {"Strategy": "Breakout", "Signal": "BUY", "Confidence": 85, "Reason": "confirmed"},
+                {"Strategy": "RSI Pullback", "Signal": "NO TRADE", "Confidence": 0, "Reason": "No trade"},
+            ],
+        }
+
+    service = build_service(voting_fn=voting_fn, alpha_score_fn=fixed_alpha_score_fn(score=90))
+    request = ScanRequest(
+        symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING, minimum_alpha_score=70
+    )
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.confidence == 71
+    assert outcome.signal_reason == "EMA Trend: bullish | Breakout: confirmed"
+
+
+def test_voting_metadata_present_in_outcome_and_legacy_dict():
+    service = build_service()
+    request = ScanRequest(symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING)
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.vote_score == 75.0
+    assert outcome.buy_votes == 3
+    assert outcome.total_votes == 4
+    assert outcome.strategy_votes is not None
+    assert len(outcome.strategy_votes) == 4
+
+    legacy = outcome.to_legacy_dict()
+    assert legacy["Vote Score"] == 75.0
+    assert legacy["BUY Votes"] == 3
+    assert legacy["Total Votes"] == 4
+
+
+def test_single_strategy_outcome_has_no_voting_fields_forced():
+    service = build_service()
+    request = ScanRequest(symbols=["AAPL"])
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.vote_score is None
+    assert outcome.buy_votes is None
+    assert outcome.total_votes is None
+    assert outcome.strategy_votes is None
+
+    legacy = outcome.to_legacy_dict()
+    assert "Vote Score" not in legacy
+    assert "BUY Votes" not in legacy
+    assert "Total Votes" not in legacy
+
+
+def test_voting_regime_filter_blocks_when_minority_of_buy_voters_allowed():
+    service = build_service(
+        regime_allowance_fn=named_regime_allowance_fn({"EMA Trend"}),
+        alpha_score_fn=fixed_alpha_score_fn(score=90),
+    )
+    request = ScanRequest(
+        symbols=["AAPL"],
+        strategy_mode=ScanStrategyMode.VOTING,
+        use_regime_filter=True,
+        minimum_alpha_score=70,
+    )
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.regime_allows_strategy is False
+    assert outcome.final_signal == "NO TRADE"
+
+
+def test_voting_regime_filter_allows_when_majority_of_buy_voters_allowed():
+    service = build_service(
+        regime_allowance_fn=named_regime_allowance_fn({"EMA Trend", "MACD Momentum"}),
+        alpha_score_fn=fixed_alpha_score_fn(score=90),
+    )
+    request = ScanRequest(
+        symbols=["AAPL"],
+        strategy_mode=ScanStrategyMode.VOTING,
+        use_regime_filter=True,
+        minimum_alpha_score=70,
+    )
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.regime_allows_strategy is True
+    assert outcome.final_signal == "BUY"
+
+
+def test_voting_regime_filter_disabled_allows_buy_despite_regime_block():
+    service = build_service(
+        regime_allowance_fn=named_regime_allowance_fn(set()),
+        alpha_score_fn=fixed_alpha_score_fn(score=90),
+    )
+    request = ScanRequest(
+        symbols=["AAPL"],
+        strategy_mode=ScanStrategyMode.VOTING,
+        use_regime_filter=False,
+        minimum_alpha_score=70,
+    )
+
+    result = service.scan(request)
+
+    assert result.outcomes[0].final_signal == "BUY"
+
+
+def test_voting_alpha_gating_blocks_low_score():
+    service = build_service(alpha_score_fn=fixed_alpha_score_fn(score=50))
+    request = ScanRequest(
+        symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING, minimum_alpha_score=70
+    )
+
+    result = service.scan(request)
+
+    assert result.outcomes[0].final_signal == "NO TRADE"
+
+
+def test_voting_risk_values_reach_the_output_correctly():
+    service = build_service(
+        stop_loss_fn=fixed_stop_loss_fn(offset=5.0),
+        take_profit_fn=fixed_take_profit_fn(offset=10.0),
+        position_size_fn=fixed_position_size_fn(shares=17, risk_amount=250.0),
+    )
+    request = ScanRequest(symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING)
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.stop_loss == 95.0
+    assert outcome.take_profit == 110.0
+    assert outcome.suggested_shares == 17
+    assert outcome.dollar_risk == 250.0
+
+
+def test_voting_queue_eligibility_still_applies():
+    save_queue = RecordingSaveQueue(return_value=1)
+    service = build_service(
+        save_queue_fn=save_queue, alpha_score_fn=fixed_alpha_score_fn(score=90)
+    )
+    request = ScanRequest(
+        symbols=["AAPL"],
+        strategy_mode=ScanStrategyMode.VOTING,
+        queue_trades=True,
+        minimum_alpha_score=70,
+    )
+
+    result = service.scan(request)
+
+    assert result.outcomes[0].queue_eligible is True
+    assert len(save_queue.calls) == 1
+
+
+def test_voting_cannot_bypass_alpha_controls():
+    service = build_service(alpha_score_fn=fixed_alpha_score_fn(score=10))
+    request = ScanRequest(
+        symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING, minimum_alpha_score=70
+    )
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.raw_signal == "BUY"
+    assert outcome.final_signal == "NO TRADE"
+
+
+def test_voting_cannot_bypass_regime_controls():
+    service = build_service(
+        regime_allowance_fn=named_regime_allowance_fn(set()),
+        alpha_score_fn=fixed_alpha_score_fn(score=95),
+    )
+    request = ScanRequest(
+        symbols=["AAPL"],
+        strategy_mode=ScanStrategyMode.VOTING,
+        use_regime_filter=True,
+        minimum_alpha_score=70,
+    )
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.raw_signal == "BUY"
+    assert outcome.final_signal == "NO TRADE"
+
+
+def test_voting_one_symbol_failure_does_not_stop_other_symbols():
+    call_count = {"n": 0}
+
+    def sometimes_failing_voting_fn(df, short_ema, long_ema, rsi_threshold, use_volume_filter):
+        call_count["n"] += 1
+
+        if call_count["n"] == 1:
+            raise ValueError("voting blew up")
+
+        return default_vote_result()
+
+    service = build_service(voting_fn=sometimes_failing_voting_fn)
+    request = ScanRequest(symbols=["BAD", "AAPL"], strategy_mode=ScanStrategyMode.VOTING)
+
+    result = service.scan(request)
+
+    bad_outcome, good_outcome = result.outcomes
+    assert bad_outcome.status == "ERROR"
+    assert bad_outcome.final_signal == "SCAN ERROR"
+    assert good_outcome.status == "OK"
+
+
+def test_voting_empty_market_data_produces_controlled_error_outcome():
+    service = build_service(
+        market_data_fn=lambda symbol, period, interval, auto_adjust: pd.DataFrame()
+    )
+    request = ScanRequest(symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING)
+
+    result = service.scan(request)
+
+    outcome = result.outcomes[0]
+    assert outcome.status == "ERROR"
+    assert outcome.strategy == "Strategy Voting"
+    assert outcome.final_signal == "NO DATA"
+
+
+def test_no_real_external_or_database_calls_occur_in_voting_mode(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("real external/database call was made")
+
+    monkeypatch.setattr("yfinance.download", fail_if_called)
+    monkeypatch.setattr("sqlite3.connect", fail_if_called)
+
+    service = build_service()
+    request = ScanRequest(
+        symbols=["AAPL"], strategy_mode=ScanStrategyMode.VOTING, queue_trades=True
+    )
+
+    result = service.scan(request)
+
+    assert result.outcomes[0].status == "OK"
 
 
 # ---------------------------------------------------------------------------

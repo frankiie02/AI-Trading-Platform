@@ -7,7 +7,7 @@ import pytest
 from core.runtime.context import RuntimeContext
 from core.runtime.exceptions import LiveModeDisabledError, UnsupportedRuntimeModeError
 from core.runtime.modes import RuntimeMode
-from core.runtime.router import RuntimeRouter
+from core.runtime.router import RuntimeResult, RuntimeRouter
 
 FORBIDDEN_IMPORT_PREFIXES = (
     "core.broker",
@@ -37,7 +37,7 @@ def make_context(mode):
 
 @pytest.mark.parametrize(
     "mode",
-    [RuntimeMode.RESEARCH, RuntimeMode.SCANNER, RuntimeMode.BACKTEST, RuntimeMode.PAPER],
+    [RuntimeMode.RESEARCH, RuntimeMode.BACKTEST, RuntimeMode.PAPER],
 )
 def test_route_returns_not_implemented_result_for_placeholder_modes(mode):
     router = RuntimeRouter()
@@ -61,6 +61,30 @@ def test_route_always_refuses_live_mode():
 
     with pytest.raises(LiveModeDisabledError):
         router.route(make_context(RuntimeMode.LIVE))
+
+
+def test_route_scanner_mode_delegates_to_scanner_runtime(monkeypatch):
+    """SCANNER must no longer be a placeholder: routing it should call the
+    dedicated scanner-runtime coordinator rather than RuntimeRouter itself
+    implementing scanner logic."""
+    import core.runtime.scanner_runtime as scanner_runtime
+
+    calls = []
+
+    def fake_run_scanner(context):
+        calls.append(context)
+        return RuntimeResult(mode=RuntimeMode.SCANNER, status="completed", message="ok")
+
+    monkeypatch.setattr(scanner_runtime, "run_scanner", fake_run_scanner)
+
+    router = RuntimeRouter()
+    context = make_context(RuntimeMode.SCANNER)
+
+    result = router.route(context)
+
+    assert len(calls) == 1
+    assert calls[0] is context
+    assert result.status == "completed"
 
 
 def test_router_module_imports_no_broker_or_execution_path():

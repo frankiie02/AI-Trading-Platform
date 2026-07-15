@@ -10,6 +10,7 @@
 - RSI Pullback strategy
 - Breakout strategy
 - MACD Momentum strategy
+- Trend Momentum strategy
 - Alpha scoring engine
 - Market regime engine
 - Live scanner
@@ -20,13 +21,17 @@
 - Execution router
 - Portfolio monitoring
 - Order management
+- Strategy voting engine
+- Runtime bootstrap and application architecture (`TradingApplication`, `RuntimeRouter`, `RuntimeMode`)
+- Reusable `ScannerService` (single-strategy and strategy-voting modes), wired into both the Live Scanner Streamlit page and the standalone `scanner` runtime mode
 
 ## Next
 
-- Strategy voting engine
 - Bollinger Reversal strategy
 - ADX Trend Strength strategy
 - SuperTrend strategy
 - Configuration cleanup
 - IBKR paper trading integration
 - IBKR live trading integration
+- Standalone `research`/`backtest`/`paper` runtime services (currently placeholder "not implemented" results)
+- Voting metadata persistence (would require a `scanner_results` schema change; currently in-memory/display-only)

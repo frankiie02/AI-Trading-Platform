@@ -1,37 +1,42 @@
 import pandas as pd
 import streamlit as st
 
-from config.settings import settings
-from core.alpha.filters import should_queue_trade
-from core.alpha.ranking import rank_opportunities
-from core.alpha.scoring import calculate_alpha_score, classify_alpha_grade
-from core.execution.trade_queue import save_buy_signals_to_queue
-from core.market_data.yahoo_data import download_price_data
-from core.regime.detector import detect_market_regime
-from core.regime.filters import strategy_allowed
-from core.risk.risk_engine import (
-    calculate_atr_stop_loss,
-    calculate_position_size,
-    calculate_take_profit
-)
 from core.scanner.scanner_repository import (
     get_recent_buy_signals,
-    get_recent_scanner_results,
-    save_scanner_results
+    get_recent_scanner_results
 )
-from core.strategy.strategy_engine import (
-    AVAILABLE_STRATEGIES,
-    generate_strategy_signals
+from core.services.scanner_service import (
+    ScanRequest,
+    ScannerPersistenceError,
+    ScannerService,
+    ScanStrategyMode,
+    TradeQueuePersistenceError
 )
+from core.strategy.strategy_engine import AVAILABLE_STRATEGIES
 
 st.set_page_config(page_title="Live Scanner", layout="wide")
 
 st.title("Live Scanner")
 
-strategy_name = st.selectbox(
-    "Strategy",
-    AVAILABLE_STRATEGIES
+scanner_mode_label = st.radio(
+    "Scanner Mode",
+    ["Single Strategy", "Strategy Voting"],
+    horizontal=True
 )
+
+if scanner_mode_label == "Strategy Voting":
+    scanner_mode = ScanStrategyMode.VOTING
+    strategy_name = None
+    st.caption(
+        "Strategy Voting combines every registered strategy's signal into "
+        "one consensus BUY/NO TRADE decision."
+    )
+else:
+    scanner_mode = ScanStrategyMode.SINGLE
+    strategy_name = st.selectbox(
+        "Strategy",
+        AVAILABLE_STRATEGIES
+    )
 
 default_symbols = "SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMD"
 
@@ -121,203 +126,111 @@ if run_scan:
         if symbol.strip()
     ]
 
-    results = []
-    progress = st.progress(0)
-
-    for index, symbol in enumerate(symbols):
-        data = download_price_data(
-            symbol=symbol,
-            period=period,
-            interval="1d",
-            auto_adjust=True
-        )
-
-        if data.empty:
-            results.append({
-                "Symbol": symbol,
-                "Strategy": strategy_name,
-                "Status": "ERROR",
-                "Signal": "NO DATA",
-                "Confidence": 0,
-                "Alpha Score": 0,
-                "Alpha Grade": "D",
-                "Reason": "No data returned",
-                "Alpha Reasons": "No data returned",
-                "Market Regime": "Unknown",
-                "Strategy Allowed": "NO",
-                "Regime Reason": "No data available",
-                "Price": None,
-                "RSI": None,
-                "ATR": None,
-                "Trend": "FAIL",
-                "Momentum": "FAIL",
-                "Volume": "FAIL",
-                "Suggested Shares": 0,
-                "Stop Loss": None,
-                "Take Profit": None,
-                "Dollar Risk": 0
-            })
-
-            progress.progress((index + 1) / len(symbols))
-            continue
-
-        data = generate_strategy_signals(
-            df=data,
-            strategy_name=strategy_name,
-            short_ema=short_ema,
-            long_ema=long_ema,
-            rsi_threshold=rsi_threshold,
-            use_volume_filter=use_volume_filter
-        )
-
-        clean_data = data.dropna()
-
-        if clean_data.empty:
-            results.append({
-                "Symbol": symbol,
-                "Strategy": strategy_name,
-                "Status": "ERROR",
-                "Signal": "NOT ENOUGH DATA",
-                "Confidence": 0,
-                "Alpha Score": 0,
-                "Alpha Grade": "D",
-                "Reason": "Not enough indicator history",
-                "Alpha Reasons": "Not enough indicator history",
-                "Market Regime": "Unknown",
-                "Strategy Allowed": "NO",
-                "Regime Reason": "Not enough indicator history",
-                "Price": None,
-                "RSI": None,
-                "ATR": None,
-                "Trend": "FAIL",
-                "Momentum": "FAIL",
-                "Volume": "FAIL",
-                "Suggested Shares": 0,
-                "Stop Loss": None,
-                "Take Profit": None,
-                "Dollar Risk": 0
-            })
-
-            progress.progress((index + 1) / len(symbols))
-            continue
-
-        market_regime = detect_market_regime(clean_data)
-        is_strategy_allowed = strategy_allowed(strategy_name, market_regime)
-
-        if is_strategy_allowed:
-            regime_reason = f"{strategy_name} is allowed in {market_regime.value} market."
-        else:
-            regime_reason = f"{strategy_name} is blocked in {market_regime.value} market."
-
-        latest = clean_data.iloc[-1]
-
-        price = float(latest["Close"])
-        atr = float(latest["ATR"])
-
-        stop_loss = calculate_atr_stop_loss(
-            entry_price=price,
-            atr=atr,
-            atr_multiplier=atr_multiplier
-        )
-
-        take_profit = calculate_take_profit(
-            entry_price=price,
-            stop_loss_price=stop_loss,
-            reward_risk_ratio=reward_risk_ratio
-        )
-
-        shares, risk_amount = calculate_position_size(
-            account_balance=settings.STARTING_BALANCE,
-            entry_price=price,
-            stop_loss_price=stop_loss,
-            risk_percent=risk_percent
-        )
-
-        raw_signal = "BUY" if latest["Signal"] == 1 else "NO TRADE"
-        confidence = int(latest.get("Signal Confidence", 0))
-        reason = latest.get("Signal Reason", "No reason available")
-
-        alpha_score, alpha_reasons = calculate_alpha_score(latest)
-        alpha_grade = classify_alpha_grade(alpha_score)
-
-        queue_allowed_by_alpha = should_queue_trade(
-            signal=raw_signal,
-            alpha_score=alpha_score,
-            minimum_score=minimum_alpha_score
-        )
-
-        if use_regime_filter:
-            final_signal = (
-                "BUY"
-                if queue_allowed_by_alpha and is_strategy_allowed
-                else "NO TRADE"
-            )
-        else:
-            final_signal = "BUY" if queue_allowed_by_alpha else "NO TRADE"
-
-        results.append({
-            "Symbol": symbol,
-            "Strategy": strategy_name,
-            "Status": "OK",
-            "Signal": final_signal,
-            "Confidence": confidence,
-            "Alpha Score": alpha_score,
-            "Alpha Grade": alpha_grade,
-            "Reason": reason,
-            "Alpha Reasons": alpha_reasons,
-            "Market Regime": market_regime.value,
-            "Strategy Allowed": "YES" if is_strategy_allowed else "NO",
-            "Regime Reason": regime_reason,
-            "Price": round(price, 2),
-            "RSI": round(float(latest["RSI"]), 2),
-            "ATR": round(atr, 2),
-            "Trend": "PASS" if latest["Trend Filter"] else "FAIL",
-            "Momentum": "PASS" if latest["Momentum Filter"] else "FAIL",
-            "Volume": "PASS" if latest["Volume Filter"] else "FAIL",
-            "Suggested Shares": shares,
-            "Stop Loss": round(stop_loss, 2),
-            "Take Profit": round(take_profit, 2),
-            "Dollar Risk": round(risk_amount, 2)
-        })
-
-        progress.progress((index + 1) / len(symbols))
-
-    save_scanner_results(results)
-
-    queued_count = 0
-
-    if add_to_queue:
-        queued_count = save_buy_signals_to_queue(results)
-
-    ranked_results = rank_opportunities(results)
-
-    st.success(
-        f"Scan complete. Results saved. "
-        f"{queued_count} BUY signal(s) added to Trade Queue."
+    request_kwargs = dict(
+        symbols=symbols,
+        strategy_mode=scanner_mode,
+        period=period,
+        interval="1d",
+        short_ema=short_ema,
+        long_ema=long_ema,
+        rsi_threshold=rsi_threshold,
+        use_volume_filter=use_volume_filter,
+        use_regime_filter=use_regime_filter,
+        risk_percent=risk_percent,
+        atr_multiplier=atr_multiplier,
+        reward_risk_ratio=reward_risk_ratio,
+        minimum_alpha_score=minimum_alpha_score,
+        queue_trades=add_to_queue
     )
 
-    st.subheader("Ranked Scanner Results")
+    if strategy_name is not None:
+        request_kwargs["strategy_name"] = strategy_name
 
-    st.dataframe(
-        ranked_results,
-        use_container_width=True,
-        hide_index=True
-    )
+    request = ScanRequest(**request_kwargs)
 
-    top_opportunities = ranked_results[
-        ranked_results["Signal"] == "BUY"
-    ].head(10)
+    progress_bar = st.progress(0)
+    progress_status = st.empty()
 
-    st.subheader("Top Tradeable Opportunities")
+    def _progress_callback(completed, total, symbol):
+        progress_bar.progress(completed / total)
+        progress_status.text(f"Scanning {symbol} ({completed}/{total})")
 
-    if top_opportunities.empty:
-        st.info("No tradeable opportunities found.")
+    service = ScannerService()
+
+    try:
+        result = service.scan(request, progress_callback=_progress_callback)
+    except ScannerPersistenceError as error:
+        st.error(f"Scanner results could not be saved: {error}")
+    except TradeQueuePersistenceError as error:
+        st.error(
+            f"Eligible trades could not be added to the trade queue: {error}"
+        )
     else:
+        failed_outcomes = [
+            outcome for outcome in result.outcomes if outcome.status == "ERROR"
+        ]
+
+        if failed_outcomes:
+            st.warning(
+                f"{len(failed_outcomes)} symbol(s) failed: "
+                + ", ".join(
+                    f"{outcome.symbol} ({outcome.signal_reason})"
+                    for outcome in failed_outcomes
+                )
+            )
+
+        st.success(
+            f"Scan complete. Results saved. "
+            f"{result.queued_count} BUY signal(s) added to Trade Queue."
+        )
+
+        st.subheader("Ranked Scanner Results")
+
         st.dataframe(
-            top_opportunities,
+            result.ranked,
             use_container_width=True,
             hide_index=True
         )
+
+        top_opportunities = result.ranked[
+            result.ranked["Signal"] == "BUY"
+        ].head(10) if not result.ranked.empty else result.ranked
+
+        st.subheader("Top Tradeable Opportunities")
+
+        if top_opportunities.empty:
+            st.info("No tradeable opportunities found.")
+        else:
+            st.dataframe(
+                top_opportunities,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        if scanner_mode == ScanStrategyMode.VOTING:
+            voting_rows = [
+                {
+                    "Symbol": outcome.symbol,
+                    "Vote Score": outcome.vote_score,
+                    "BUY Votes": outcome.buy_votes,
+                    "Total Votes": outcome.total_votes,
+                    "Confidence": outcome.confidence,
+                    "Reasons": outcome.signal_reason
+                }
+                for outcome in result.outcomes
+                if outcome.status == "OK"
+            ]
+
+            st.subheader("Voting Detail")
+
+            if voting_rows:
+                st.dataframe(
+                    pd.DataFrame(voting_rows),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("No successful voting outcomes to display.")
 
 st.divider()
 
