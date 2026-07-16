@@ -334,6 +334,13 @@ class PaperTradingService:
     def get_positions(self) -> List[PaperPosition]:
         return [self._position_from_row(row) for row in get_all_position_rows(self._db_path)]
 
+    def get_pending_queue_items(self):
+        """Read-only view of pending trade_queue rows (via the same injected
+        collaborator process_queue() uses), so pages can display and select
+        queue items through PaperTradingService rather than importing
+        core.execution.trade_queue directly."""
+        return self._get_pending_trades_fn(db_path=self._db_path)
+
     def get_orders(self, status: Optional[OrderStatus] = None) -> List[PaperOrder]:
         status_value = status.value if isinstance(status, OrderStatus) else status
         return [self._order_from_row(row) for row in get_order_rows(status_value, self._db_path)]
