@@ -286,6 +286,13 @@ class PaperTradingService:
 
         self.initialise_account()
 
+    @property
+    def db_path(self) -> str:
+        """Read-only: lets collaborators (e.g. PortfolioService) build their
+        own repository readers against the exact same database this
+        instance is using, without duplicating persistence logic."""
+        return self._db_path
+
     # ------------------------------------------------------------------
     # Account
     # ------------------------------------------------------------------

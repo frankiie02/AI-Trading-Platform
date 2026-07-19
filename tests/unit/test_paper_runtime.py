@@ -13,6 +13,7 @@ from core.services.paper_trading_service import (
     PaperTradingResult,
     PaperTradingServiceError,
 )
+from core.services.portfolio_service import PortfolioSummary
 
 FORBIDDEN_IMPORT_PREFIXES = (
     "streamlit",
@@ -78,6 +79,37 @@ class FakePaperTradingService:
         return self._process_queue_result
 
 
+def make_portfolio_summary(account, position_count=0, **overrides):
+    fields = dict(
+        starting_capital=account.starting_balance,
+        cash=account.cash,
+        reserved_cash=account.reserved_cash,
+        invested_capital=0.0,
+        market_value=account.equity - account.cash,
+        equity=account.equity,
+        realised_pnl=account.realised_pnl,
+        unrealised_pnl=account.unrealised_pnl,
+        total_pnl=account.realised_pnl + account.unrealised_pnl,
+        total_return_pct=0.0,
+        gross_exposure_pct=0.0,
+        net_exposure_pct=0.0,
+        cash_pct=0.0,
+        position_count=position_count,
+        largest_position_pct=None,
+        average_position_value=None,
+    )
+    fields.update(overrides)
+    return PortfolioSummary(**fields)
+
+
+class FakePortfolioService:
+    def __init__(self, summary=None):
+        self._summary = summary or make_portfolio_summary(make_account())
+
+    def get_summary(self):
+        return self._summary
+
+
 # ---------------------------------------------------------------------------
 # build_paper_settings
 # ---------------------------------------------------------------------------
@@ -114,7 +146,9 @@ def test_build_paper_settings_honours_injected_settings():
 def test_run_paper_trading_routes_to_service():
     fake_service = FakePaperTradingService()
 
-    result = run_paper_trading(make_context(), service=fake_service)
+    result = run_paper_trading(
+        make_context(), service=fake_service, portfolio_service=FakePortfolioService()
+    )
 
     assert result.mode is RuntimeMode.PAPER
     assert result.status == "completed"
@@ -124,7 +158,9 @@ def test_run_paper_trading_routes_to_service():
 def test_run_paper_trading_defaults_queue_processing_to_false():
     fake_service = FakePaperTradingService()
 
-    run_paper_trading(make_context(), service=fake_service)
+    run_paper_trading(
+        make_context(), service=fake_service, portfolio_service=FakePortfolioService()
+    )
 
     assert fake_service.received_process_queue_kwargs[0]["enabled"] is False
 
@@ -133,7 +169,9 @@ def test_run_paper_trading_honours_explicit_queue_processing_setting():
     fake_service = FakePaperTradingService()
     settings = {"PAPER_PROCESS_QUEUE": True}
 
-    run_paper_trading(make_context(settings), service=fake_service)
+    run_paper_trading(
+        make_context(settings), service=fake_service, portfolio_service=FakePortfolioService()
+    )
 
     assert fake_service.received_process_queue_kwargs[0]["enabled"] is True
 
@@ -141,19 +179,25 @@ def test_run_paper_trading_honours_explicit_queue_processing_setting():
 def test_run_paper_trading_returns_concise_summary():
     account = make_account(cash=8000.0, equity=8500.0, realised_pnl=50.0, unrealised_pnl=25.0)
     fake_service = FakePaperTradingService(account=account)
+    fake_portfolio = FakePortfolioService(make_portfolio_summary(account, position_count=2))
 
-    result = run_paper_trading(make_context(), service=fake_service)
+    result = run_paper_trading(
+        make_context(), service=fake_service, portfolio_service=fake_portfolio
+    )
 
     assert "$8,000.00" in result.message
     assert "$8,500.00" in result.message
     assert "$50.00" in result.message
     assert "$25.00" in result.message
+    assert "2 open position(s)" in result.message
 
 
 def test_run_paper_trading_skips_price_updates_without_price_fetch_fn():
     fake_service = FakePaperTradingService(positions=[])
 
-    run_paper_trading(make_context(), service=fake_service)
+    run_paper_trading(
+        make_context(), service=fake_service, portfolio_service=FakePortfolioService()
+    )
 
     assert fake_service.update_positions_calls == []
     assert fake_service.check_exits_calls == []
@@ -170,7 +214,8 @@ def test_run_paper_trading_uses_injected_price_fetch_fn():
     fake_service = FakePaperTradingService(positions=[position])
 
     result = run_paper_trading(
-        make_context(), service=fake_service, price_fetch_fn=lambda symbol: 123.45
+        make_context(), service=fake_service, price_fetch_fn=lambda symbol: 123.45,
+        portfolio_service=FakePortfolioService(),
     )
 
     assert fake_service.update_positions_calls == [{"AAPL": 123.45}]
@@ -182,7 +227,33 @@ def test_run_paper_trading_propagates_controlled_service_errors():
     fake_service = FakePaperTradingService(raises=PaperTradingServiceError("db locked"))
 
     with pytest.raises(PaperTradingServiceError):
-        run_paper_trading(make_context(), service=fake_service)
+        run_paper_trading(
+            make_context(), service=fake_service, portfolio_service=FakePortfolioService()
+        )
+
+
+def test_run_paper_trading_sources_summary_from_portfolio_service_not_paper_service():
+    """The runtime's message must come from PortfolioService.get_summary(),
+    not from re-deriving cash/equity/position-count off PaperTradingService
+    directly - proves no duplicated portfolio equations in paper_runtime.py."""
+    fake_service = FakePaperTradingService(
+        account=make_account(cash=1.0, equity=2.0, realised_pnl=3.0, unrealised_pnl=4.0)
+    )
+    distinct_summary = make_portfolio_summary(
+        make_account(cash=111.0, equity=222.0, realised_pnl=333.0, unrealised_pnl=444.0),
+        position_count=7,
+    )
+
+    result = run_paper_trading(
+        make_context(), service=fake_service,
+        portfolio_service=FakePortfolioService(distinct_summary),
+    )
+
+    assert "$111.00" in result.message
+    assert "$222.00" in result.message
+    assert "$333.00" in result.message
+    assert "$444.00" in result.message
+    assert "7 open position(s)" in result.message
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ import sqlite3
 import pytest
 
 from core.database.database import get_connection, initialise_database
+from core.portfolio.portfolio_repository import get_snapshot_rows, insert_snapshot
 
 
 @pytest.fixture
@@ -31,8 +32,22 @@ def test_initialise_database_creates_new_tables_on_fresh_db(db_path):
 
     assert "paper_orders" in tables
     assert "paper_audit_events" in tables
+    assert "portfolio_snapshots" in tables
     # Pre-existing tables are still created, unrenamed.
     assert {"account_state", "paper_positions", "paper_trades", "trade_queue", "scanner_results"} <= tables
+
+
+def test_portfolio_snapshots_table_has_expected_columns(db_path):
+    initialise_database(db_path)
+
+    conn = get_connection(db_path)
+    columns = _columns(conn, "portfolio_snapshots")
+    conn.close()
+
+    assert {
+        "id", "timestamp", "account_id", "cash", "market_value", "equity",
+        "realised_pnl", "unrealised_pnl", "gross_exposure", "position_count",
+    } <= columns
 
 
 def test_new_columns_present_on_existing_tables(db_path):
@@ -116,7 +131,9 @@ def test_migration_is_additive_on_a_pre_existing_legacy_shaped_db(db_path):
         VALUES (1, 100000, 97000, '2026-01-01 00:00:00')
     """)
     cursor.execute("""
-        INSERT INTO paper_positions (symbol, shares, entry_price, current_price, market_value, unrealised_pnl, updated_at)
+        INSERT INTO paper_positions (
+            symbol, shares, entry_price, current_price, market_value, unrealised_pnl, updated_at
+        )
         VALUES ('AAPL', 10, 100.0, 105.0, 1050.0, 50.0, '2026-01-01 00:00:00')
     """)
     conn.commit()
@@ -147,3 +164,29 @@ def test_migration_is_additive_on_a_pre_existing_legacy_shaped_db(db_path):
 
     assert "paper_orders" in tables
     assert "paper_audit_events" in tables
+    assert "portfolio_snapshots" in tables
+
+
+def test_portfolio_snapshot_repository_round_trip(db_path):
+    """Focused integration test for core/portfolio/portfolio_repository.py,
+    using a temporary SQLite database only."""
+    insert_snapshot(
+        account_id="default", cash=9000.0, market_value=1000.0, equity=10000.0,
+        realised_pnl=0.0, unrealised_pnl=0.0, gross_exposure=10.0, position_count=1,
+        db_path=db_path,
+    )
+    insert_snapshot(
+        account_id="default", cash=8500.0, market_value=1600.0, equity=10100.0,
+        realised_pnl=0.0, unrealised_pnl=100.0, gross_exposure=15.8, position_count=1,
+        db_path=db_path,
+    )
+
+    rows = get_snapshot_rows(account_id="default", db_path=db_path)
+
+    assert len(rows) == 2
+    assert rows[0]["equity"] == 10000.0
+    assert rows[1]["equity"] == 10100.0
+
+    limited = get_snapshot_rows(account_id="default", limit=1, db_path=db_path)
+    assert len(limited) == 1
+    assert limited[0]["equity"] == 10100.0

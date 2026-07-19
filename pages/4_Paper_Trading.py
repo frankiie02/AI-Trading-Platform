@@ -2,7 +2,6 @@ import pandas as pd
 import streamlit as st
 
 from config.settings import settings
-from core.execution.trade_queue import get_pending_trades
 from core.market_data.yahoo_data import download_price_data
 from core.pipeline.models import ScanStrategyMode, TradingDecision
 from core.services.paper_trading_service import (
@@ -126,7 +125,7 @@ st.divider()
 
 st.subheader("Queued Eligible Signals")
 
-pending = get_pending_trades()
+pending = service.get_pending_queue_items()
 
 if pending.empty:
     st.info("No queued signals pending.")

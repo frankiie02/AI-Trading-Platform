@@ -167,6 +167,25 @@ def initialise_database(db_path=DB_PATH):
     add_column_if_missing(cursor, "scanner_results", "strategy_allowed", "TEXT")
     add_column_if_missing(cursor, "scanner_results", "regime_reason", "TEXT")
 
+    # Portfolio snapshot history for PortfolioService (core/services/portfolio_service.py).
+    # Snapshot creation is an explicit action (PortfolioService.create_snapshot()),
+    # never written invisibly on a read, so this table only grows when a user
+    # or the paper runtime explicitly requests a snapshot.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            cash REAL NOT NULL,
+            market_value REAL NOT NULL,
+            equity REAL NOT NULL,
+            realised_pnl REAL NOT NULL,
+            unrealised_pnl REAL NOT NULL,
+            gross_exposure REAL NOT NULL,
+            position_count INTEGER NOT NULL
+        )
+    """)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS trade_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

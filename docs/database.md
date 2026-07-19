@@ -1,6 +1,6 @@
 # Database
 
-The platform uses a single local SQLite file, `data/trading_platform.db` (`DB_PATH` / `DATABASE_PATH`). There is no ORM: `core/database/database.py` owns connection handling (`get_connection`) and idempotent schema creation/migration (`initialise_database`, `add_column_if_missing`). Domain-specific persistence lives in flat, table-scoped modules that hand-write SQL against that connection - `core/scanner/scanner_repository.py`, `core/execution/trade_queue.py`, `core/execution/paper_trader.py` (legacy), and `core/execution/paper_orders_repository.py` (used by `PaperTradingService`) - rather than a generic repository/DAO base class.
+The platform uses a single local SQLite file, `data/trading_platform.db` (`DB_PATH` / `DATABASE_PATH`). There is no ORM: `core/database/database.py` owns connection handling (`get_connection`) and idempotent schema creation/migration (`initialise_database`, `add_column_if_missing`). Domain-specific persistence lives in flat, table-scoped modules that hand-write SQL against that connection - `core/scanner/scanner_repository.py`, `core/execution/trade_queue.py`, `core/execution/paper_trader.py` (legacy), `core/execution/paper_orders_repository.py` (used by `PaperTradingService`), and `core/portfolio/portfolio_repository.py` (used by `PortfolioService`) - rather than a generic repository/DAO base class.
 
 Schema changes are always additive: `initialise_database()` is safe to call repeatedly (`CREATE TABLE IF NOT EXISTS` + `PRAGMA table_info`-guarded `ALTER TABLE ... ADD COLUMN`), and no existing table or column has ever been renamed or removed.
 
@@ -69,6 +69,18 @@ Unchanged pre-execution staging table (`status`: `"PENDING"` on insert, then fre
 
 ### `scanner_results`
 Unchanged; unrelated to paper trading.
+
+### `portfolio_snapshots` (new)
+Explicit portfolio-history points for `PortfolioService` (`core/services/portfolio_service.py`) - only written by `PortfolioService.create_snapshot()`, never on a read. Read via `PortfolioService.get_snapshots(limit=None)`, oldest first.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `timestamp` | TEXT | |
+| `account_id` | TEXT | matches `PaperTradingService`'s `account_id` (currently always `"default"` - `account_state` is a singleton row, this column is forward-looking for multi-account support) |
+| `cash`, `market_value`, `equity`, `realised_pnl`, `unrealised_pnl` | REAL | a point-in-time copy of `PortfolioSummary`'s corresponding fields at snapshot time |
+| `gross_exposure` | REAL | `PortfolioSummary.gross_exposure_pct` at snapshot time |
+| `position_count` | INTEGER | |
 
 ## Atomicity
 

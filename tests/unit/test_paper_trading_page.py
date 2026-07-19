@@ -5,7 +5,6 @@ import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
-import core.execution.trade_queue as trade_queue_module
 import core.services.paper_trading_service as paper_trading_service_module
 from core.services.paper_trading_service import (
     InvalidPaperOrderError,
@@ -52,6 +51,7 @@ class FakePaperTradingService:
     account = None
     positions = []
     orders = []
+    pending_queue_items = None
     create_order_raises = None
     process_queue_result = None
     process_queue_raises = None
@@ -69,6 +69,9 @@ class FakePaperTradingService:
 
     def get_orders(self, status=None):
         return FakePaperTradingService.orders
+
+    def get_pending_queue_items(self):
+        return FakePaperTradingService.pending_queue_items
 
     def create_order_from_decision(self, decision, source_reference=None, auto_fill=True, quantity=None):
         self.create_order_calls.append((decision, source_reference, auto_fill))
@@ -95,12 +98,12 @@ def isolate_page_collaborators(monkeypatch):
     FakePaperTradingService.account = make_account()
     FakePaperTradingService.positions = []
     FakePaperTradingService.orders = []
+    FakePaperTradingService.pending_queue_items = pd.DataFrame()
     FakePaperTradingService.create_order_raises = None
     FakePaperTradingService.process_queue_result = None
     FakePaperTradingService.process_queue_raises = None
 
     monkeypatch.setattr(paper_trading_service_module, "PaperTradingService", FakePaperTradingService)
-    monkeypatch.setattr(trade_queue_module, "get_pending_trades", lambda db_path=None: pd.DataFrame())
 
     yield
 
@@ -134,6 +137,28 @@ def test_page_does_not_import_forbidden_modules():
 def test_page_imports_paper_trading_service():
     source = PAGE_SOURCE_PATH.read_text()
     assert "PaperTradingService" in source
+
+
+def test_page_no_longer_imports_trade_queue_module_directly():
+    """Queue reads must go through PaperTradingService.get_pending_queue_items()
+    rather than importing core.execution.trade_queue.get_pending_trades
+    directly - the Paper Trading page cleanup for this milestone."""
+    tree = ast.parse(PAGE_SOURCE_PATH.read_text())
+    imports = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imports.append(node.module)
+        elif isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+
+    assert "core.execution.trade_queue" not in imports
+    assert "get_pending_trades" not in PAGE_SOURCE_PATH.read_text()
+
+
+def test_page_reads_pending_queue_via_service_method():
+    source = PAGE_SOURCE_PATH.read_text()
+    assert "get_pending_queue_items()" in source
 
 
 def test_page_runs_without_exception():

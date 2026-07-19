@@ -219,16 +219,16 @@ Key points:
 - Trailing-stop is not part of `PaperPosition`/`PaperTradingService` - `paper_positions.trailing_stop` remains a legacy-`PaperTrader`-only column.
 - `reserved_cash` exists on `PaperAccount`/`account_state` for forward compatibility but is always `0` in this milestone; nothing yet holds cash aside for a not-yet-filled order.
 - Partial order fills are explicitly deferred, not faked: an order either fills in full (at a cash/position-limit-capped quantity) or is rejected before submission.
-- `pages/4_Paper_Trading.py`'s own queued-signal "Process Selected Queue Item(s)" button still imports `get_pending_trades` from `core.execution.trade_queue` directly rather than through `PaperTradingService.get_pending_queue_items()` (added in this milestone) - a trivial, out-of-scope-for-this-milestone follow-up to fully consolidate queue reads behind the service. It shares the same latent "success message wiped by an immediate `st.rerun()`" issue that `pages/5_Trade_Queue.py` fixed for its own queue-processing block; not corrected there since that page was out of scope for this milestone.
+- `pages/4_Paper_Trading.py`'s queued-signal "Process Selected Queue Item(s)" button now reads pending items through `PaperTradingService.get_pending_queue_items()` rather than importing `core.execution.trade_queue.get_pending_trades` directly (fixed in the PortfolioService milestone) - every active paper-trading page now shares the same read/write boundary through `PaperTradingService`.
 
 ## Standalone Paper Runtime
 
-`core/runtime/paper_runtime.py` provides `run_paper_trading(context, service=None, price_fetch_fn=None)`, the standalone coordinator for `RuntimeMode.PAPER`, following the same shape as `run_scanner`/`run_backtest`:
+`core/runtime/paper_runtime.py` provides `run_paper_trading(context, service=None, price_fetch_fn=None, portfolio_service=None)`, the standalone coordinator for `RuntimeMode.PAPER`, following the same shape as `run_scanner`/`run_backtest`:
 
 1. `build_paper_settings(context.settings)` builds `PaperTradingService` constructor kwargs (plus a `process_queue` flag) from the `PAPER_*` settings (`config/defaults.py`), falling back to their defaults for any key absent from `context.settings`.
 2. Optionally refreshes open-position prices/exits through an injected `price_fetch_fn(symbol) -> float` - if none is supplied (the default), position marking/exit-checking is skipped and no market data is downloaded implicitly; only queue processing runs.
 3. Calls `PaperTradingService.process_queue()` (a real `PaperTradingService()` by default - paper/local only, no broker), gated by `PAPER_PROCESS_QUEUE`, which **defaults to `False`**: nothing executes automatically unless explicitly enabled.
-4. Returns a `RuntimeResult` with a concise terminal summary (cash, equity, open positions, orders filled/rejected, realised/unrealised P&L).
+4. Returns a `RuntimeResult` with a concise terminal summary (cash, equity, open positions, orders filled/rejected, realised/unrealised P&L), sourced from `PortfolioService.get_summary()` (a real `PortfolioService()` built against the exact same `db_path` as the `PaperTradingService` instance, via its `db_path` property) rather than re-deriving those figures directly from `PaperTradingService` - the runtime never duplicates portfolio equations, matching the "PortfolioService is the single authoritative source" intent.
 5. Performs no Streamlit rendering and imports no broker/live-execution module.
 
 `RuntimeRouter` now dispatches `RuntimeMode.PAPER` to it (imported lazily inside `route()`, matching the scanner/backtest dispatch pattern) instead of returning a placeholder "not implemented" result; `research` remains a placeholder.
@@ -250,3 +250,53 @@ Key points:
 | `PAPER_REQUIRE_TAKE_PROFIT` | `False` |
 
 Live trading remains disabled: `RuntimeMode.LIVE` always raises `LiveModeDisabledError` regardless of paper configuration, and nothing in the paper runtime or `PaperTradingService` submits broker orders.
+
+## Portfolio Service
+
+`PortfolioService` (`core/services/portfolio_service.py`) is the authoritative **read-only** analytics layer for portfolio state: valuation, exposure, allocation, performance, drawdown, completed-trade statistics, snapshots, and reconciliation reporting. It never creates, fills, or cancels an order, never mutates cash or position quantities, and never submits a broker order - every state-changing paper-trading action remains in `PaperTradingService`. `pages/2_Portfolio.py` is its only current consumer (plus `core/runtime/paper_runtime.py`'s terminal summary); it is designed to also serve a future broker adapter and API layer without change, per the milestone's target architecture:
+
+```text
+PaperTradingService ───────┐
+BacktestService ───────────┤   (future integration)
+Future Broker Adapter ─────┼──► PortfolioService
+Dashboard / API ───────────┘
+                                  │
+                                  ├── valuation, exposure, allocation
+                                  ├── performance, drawdown
+                                  ├── portfolio snapshots
+                                  └── reconciliation views
+```
+
+Key points:
+
+- **Reads the same rows `PaperTradingService` reads, not `PaperTradingService`'s own objects.** `PortfolioService` is injected with the same repository-level functions (`get_account_row`, `get_all_position_rows`, `get_trade_rows` from `core/execution/paper_orders_repository.py`) rather than wrapping `PaperTradingService.get_account()`/`get_positions()`/`get_trades()`. This lets it expose richer analytics fields (cost basis, portfolio weight, exposure, performance) without `PaperTradingService`'s own models needing to grow them, and keeps the two services as peers rather than one wrapping the other. The one deliberate exception is reconciliation: `PortfolioService.get_reconciliation()` surfaces, rather than duplicates, an injected `PaperTradingService.reconcile()` (defaulting to constructing one against the same `db_path` if none is injected).
+- **Portfolio equations** (all division-by-zero-guarded via a private `_safe_pct` helper, returning `None` rather than raising or fabricating a value):
+  ```text
+  cost_basis           = quantity × average_entry_price
+  market_value         = quantity × current_price
+  unrealised_pnl        = market_value - cost_basis
+  equity                = cash + sum(market_value of open positions)
+  total_pnl              = realised_pnl + unrealised_pnl
+  total_return_pct       = total_pnl / starting_capital × 100
+  gross_exposure_pct     = sum(abs(market_value)) / equity × 100
+  net_exposure_pct       = sum(signed market_value) / equity × 100
+  position_weight_pct    = position market_value / equity × 100
+  ```
+  `unrealised_pnl` is computed once and is never added into `equity` a second time - `equity` is `cash + market_value` only. Because the platform is long-only, `gross_exposure_pct` and `net_exposure_pct` are currently numerically identical; the two are kept as separate fields for when short positions exist.
+- **Typed models** (`core/services/portfolio_service.py`): `PortfolioPosition`, `PortfolioSummary`, `PortfolioPerformance`, `PortfolioSnapshot`, and `PortfolioAnalysis` (the aggregate: summary + positions + performance + allocation + snapshots + warnings + reconciliation) - all distinct from `PaperTradingService`'s `PaperAccount`/`PaperPosition`/`PaperTrade`, since they carry different (richer, display-oriented) fields.
+- **Portfolio snapshots** (`portfolio_snapshots` table, additive - see `docs/database.md`; persistence in `core/portfolio/portfolio_repository.py`, mirroring `paper_orders_repository.py`'s convention): snapshot creation is an **explicit** action (`PortfolioService.create_snapshot()`) - never written invisibly on a read. `get_snapshots(limit=None)` returns them in chronological order (oldest first, matching equity-curve plotting order).
+- **Performance metrics from snapshots**: the equity curve, drawdown, volatility, Sharpe, and Sortino are built entirely from `portfolio_snapshots`, not fabricated. Because snapshots are explicit/user-triggered rather than fixed daily bars (unlike `BacktestService`'s bar-by-bar equity curve with its 252-trading-day annualisation), these statistics are deliberately **unannualised, per-snapshot-period** figures - forcing `BacktestService`'s daily-bar assumption onto arbitrary-cadence snapshots would misrepresent them. With zero snapshots, all of these fields are `None` and a warning is added; with exactly one snapshot, drawdown is trivially `0%` but volatility/Sharpe/Sortino still require a second snapshot and stay `None` with a warning. Completed-trade statistics (win rate, profit factor, expectancy, average win/loss, total fees) are computed directly from `paper_trades` rows with a non-null `exit_reason`, independent of snapshots.
+- **Error hierarchy**: `PortfolioServiceError` → `PortfolioDataError`, `SnapshotPersistenceError` - the same one-base-plus-specific-subclasses convention as the other services.
+- **No broker path, no Streamlit import, no direct SQL**: enforced by AST-based import-boundary tests (`tests/unit/test_portfolio_service.py`), matching `PaperTradingService`'s own guard tests.
+
+### Portfolio Page
+
+`pages/2_Portfolio.py` is a thin, read-only analytics adapter: it constructs both `PaperTradingService` (for the one state-changing action - "Refresh Position Prices", which calls `update_positions`/`check_exits`) and `PortfolioService` (for everything else), calls `PortfolioService.get_analysis()` once, and renders the result directly - it performs no allocation, average-position, largest-position, or any other statistic calculation itself. It shows controlled warnings for insufficient snapshot history, a reconciliation success/mismatch banner, and an explicit "Create Portfolio Snapshot" button.
+
+### Known limitations / deferred work
+
+- Long-only: `gross_exposure_pct`/`net_exposure_pct` are currently always equal; the formula already keeps them as separate fields for when short positions are introduced.
+- No sector/asset-class metadata, so allocation is per-symbol only.
+- No benchmark attribution (unlike `BacktestService`'s buy-and-hold comparison).
+- Historical performance metrics (equity curve, drawdown, volatility, Sharpe, Sortino) are only as good as the snapshot history that exists - there is no scheduled/automatic snapshot creation in this milestone, only the explicit page button and (optionally) runtime-triggered reads via `get_summary()`, which does **not** create a snapshot.
+- No live broker portfolio state - `PortfolioService` only ever reads the local paper account.

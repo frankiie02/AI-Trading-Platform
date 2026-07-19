@@ -5,6 +5,7 @@ from core.runtime.context import RuntimeContext
 from core.runtime.modes import RuntimeMode
 from core.runtime.router import RuntimeResult
 from core.services.paper_trading_service import PaperTradingService
+from core.services.portfolio_service import PortfolioService
 
 
 def _setting(settings: Dict[str, Any], key: str):
@@ -32,6 +33,7 @@ def run_paper_trading(
     context: RuntimeContext,
     service: Optional[PaperTradingService] = None,
     price_fetch_fn: Optional[Callable[[str], float]] = None,
+    portfolio_service: Optional[PortfolioService] = None,
 ) -> RuntimeResult:
     """Standalone paper-trading runtime coordinator.
 
@@ -42,11 +44,24 @@ def run_paper_trading(
     skipped and only queue processing runs), and processes the trade
     queue only if PAPER_PROCESS_QUEUE is explicitly enabled (defaults to
     False). Contains no Streamlit, broker, or live-execution code.
+
+    The terminal summary (cash, equity, position count, realised/
+    unrealised P&L) is sourced from PortfolioService rather than
+    re-deriving those figures here, so the runtime never duplicates
+    portfolio equations - PortfolioService is the single authoritative
+    source for them.
     """
     built = build_paper_settings(context.settings)
     process_queue = built.pop("process_queue")
 
     service = service or PaperTradingService(logger=context.logger, **built)
+    portfolio_service = portfolio_service or PortfolioService(
+        db_path=service.db_path,
+        account_id=built["account_id"],
+        starting_balance=built["starting_balance"],
+        paper_trading_service=service,
+        logger=context.logger,
+    )
 
     if price_fetch_fn is not None:
         positions = service.get_positions()
@@ -65,16 +80,15 @@ def run_paper_trading(
             service.check_exits(price_map)
 
     result = service.process_queue(enabled=process_queue)
-    account = service.get_account()
-    open_positions = len(service.get_positions())
+    summary = portfolio_service.get_summary()
 
     message = (
-        f"Paper trading completed: cash ${account.cash:,.2f}, "
-        f"equity ${account.equity:,.2f}, {open_positions} open position(s), "
+        f"Paper trading completed: cash ${summary.cash:,.2f}, "
+        f"equity ${summary.equity:,.2f}, {summary.position_count} open position(s), "
         f"{len(result.orders_filled)} order(s) filled, "
         f"{len(result.orders_rejected)} rejected, "
-        f"realised P&L ${account.realised_pnl:,.2f}, "
-        f"unrealised P&L ${account.unrealised_pnl:,.2f}."
+        f"realised P&L ${summary.realised_pnl:,.2f}, "
+        f"unrealised P&L ${summary.unrealised_pnl:,.2f}."
     )
 
     context.logger.info(message)
