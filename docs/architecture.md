@@ -304,7 +304,7 @@ Key points:
 
 ## Broker Interface
 
-`core/broker/` defines a stable, broker-neutral contract (`BrokerInterface`) and its first concrete adapter, `PaperBroker`, ahead of any real broker integration. The abstraction exists so orchestration code can be written once against `BrokerInterface` and later point at IBKR/Alpaca/OANDA without change:
+`core/broker/` defines a stable, broker-neutral contract (`BrokerInterface`) and two concrete adapters, `PaperBroker` and `IBKRBroker`. The abstraction exists so orchestration code can be written once against `BrokerInterface` and later point at any broker without change:
 
 ```text
 TradingPipeline
@@ -313,8 +313,8 @@ Execution orchestration
       │
 BrokerInterface
       │
-      ├── PaperBroker            (implemented)
-      ├── Future IBKRBroker
+      ├── PaperBroker            (implemented - simulated fills)
+      ├── IBKRBroker             (implemented - read-only account inspection)
       ├── Future AlpacaBroker
       └── Future OANDABroker
 ```
@@ -327,6 +327,9 @@ PaperTradingService   -> local paper state and validated mutation
 PortfolioService      -> read-only valuation and analytics
 BrokerInterface        -> broker-facing account/position/order/fill contract
 PaperBroker             -> adapts PaperTradingService/PortfolioService to BrokerInterface
+IBKRBroker              -> adapts a real IBKR connection (via ib_insync) to
+                           BrokerInterface, read-only; never touches
+                           PaperTradingService/PortfolioService
 ```
 
 Key points:
@@ -352,14 +355,24 @@ Key points:
 - **Connection semantics**: `PaperBroker` starts `DISCONNECTED`. `connect()`/`disconnect()` only flip an in-memory flag - no socket, thread, process, or network call is ever made, and connection state is never persisted to the database (verified by a test that reads `account_state` before/after connect/disconnect). Every account/position/order operation raises `BrokerConnectionError` while disconnected. Both `connect()` and `disconnect()` are idempotent. This exists purely for interface parity with brokers that manage a genuine connection; a local paper account has nothing to connect to.
 - **Order status mapping**: `PaperTradingService.OrderStatus.CREATED`/`VALIDATED` → `BrokerOrderStatus.PENDING` (pre-submission internal states, not meaningfully distinct in broker-neutral terms), `SUBMITTED` → `SUBMITTED`, `FILLED`/`REJECTED`/`CANCELLED`/`EXPIRED` map 1:1. No persisted database value was renamed to achieve this - the mapping lives entirely in `PaperBroker._to_broker_order()`.
 - **Cancellation**: delegates directly to `PaperTradingService.cancel_order()`, cancellable only from `{CREATED, VALIDATED, SUBMITTED}` (unchanged). "Release reserved cash" does not apply in this milestone: `PaperTradingService` never holds cash aside before a `FILLED` order debits it (`reserved_cash` is always `0`), so there is nothing to release - documented rather than fabricated. An `ORDER_CANCELLED` audit event is written (reusing the existing audit mechanism); positions and trade history are never touched by cancellation.
-- **Optional factory** (`core/broker/factory.py`): `create_broker(environment, *, paper_service=None, portfolio_service=None)` supports only `BrokerEnvironment.PAPER`; any other environment raises `BrokerUnsupportedOperationError`. No plugin/registry framework.
-- **Legacy `ExecutionRouter`/`PaperTrader`**: `PaperBroker` has zero dependency on either (statically verified by an AST-based test parsing every file in `core/broker/`) - they remain untouched legacy compatibility modules, unchanged from prior milestones.
-- **No broker network dependency**: no `ib_insync`, no IBKR/Alpaca/OANDA SDK, no socket/thread/process is created anywhere in `core/broker/` (statically verified via AST/grep import-boundary tests, and at runtime via a test that monkeypatches `socket.socket` to fail if called across a full connect → submit → cancel → disconnect workflow).
+- **Optional factory** (`core/broker/factory.py`): `create_broker(environment, *, paper_service=None, portfolio_service=None)` supports only `BrokerEnvironment.PAPER`; any other environment raises `BrokerUnsupportedOperationError`. A separate sibling function, `create_ibkr_broker(config, *, client=None)`, constructs an `IBKRBroker` from an `IBKRConnectionConfig` - deliberately not folded into `create_broker()`, since `BrokerEnvironment.PAPER` already means "local `PaperBroker`" there. Neither factory function connects during construction, and neither is called from any runtime mode or Streamlit page. No plugin/registry framework.
+- **Legacy `ExecutionRouter`/`PaperTrader`**: `PaperBroker` and `IBKRBroker` both have zero dependency on either (statically verified by AST-based tests parsing every file in `core/broker/`) - they remain untouched legacy compatibility modules, unchanged from prior milestones.
+- **No broker network dependency in `PaperBroker`**: no `ib_insync`, no broker SDK, no socket/thread/process is created anywhere in `paper_broker.py`/`base.py`/`models.py`/`errors.py` (statically verified via AST/grep import-boundary tests, and at runtime via a test that monkeypatches `socket.socket` to fail if called across a full connect → submit → cancel → disconnect workflow).
+
+### IBKRBroker (read-only)
+
+`core/broker/ibkr_broker.py` (`IBKRBroker`) and `core/broker/ibkr_client.py` (`IBKRClientProtocol`/`IBInsyncClient`) implement `BrokerInterface` for **Interactive Brokers account inspection only**. Full detail lives in `docs/broker.md`; the architecturally relevant points:
+
+- `IBKRBroker` depends only on `IBKRClientProtocol` (a `typing.Protocol`, structurally typed) - it never imports `ib_insync` directly, so tests inject a plain fake client with zero optional-dependency requirement. Only `IBInsyncClient.__init__` touches the real `ib_insync.IB` class, and only when actually constructed (lazily, inside `IBKRBroker._build_default_client()`, never at module import time).
+- `submit_order()`/`cancel_order()` are two-line methods that immediately raise `BrokerUnsupportedOperationError` - there is no dormant call to any IBKR order-placement/cancellation API anywhere in either file, statically proven by `tests/unit/test_ibkr_broker.py`.
+- `IBKRConnectionConfig` fails closed in `__post_init__`: `read_only=False` or `environment=BrokerEnvironment.LIVE` both raise before a config object can even be constructed, let alone passed to `IBKRBroker`.
+- Not wired into `TradingApplication`, `RuntimeRouter`, `paper_runtime.py`, any Streamlit page, the Trade Queue, the scanner, or backtesting - it is reachable only by direct construction (script, notebook, or test).
 
 ### Known limitations / deferred work
 
-- Only `PaperBroker` exists; `IBKRBroker`/`AlpacaBroker`/`OANDABroker` are not implemented (this milestone establishes and validates the contract first, per its own scope).
+- `AlpacaBroker`/`OANDABroker` are not implemented. `IBKRBroker` exists but is permanently read-only (no order submission/cancellation), not a "coming later" gap.
 - `BrokerOrderRequest.time_in_force` is accepted but not enforced - no order expires on a timer in this platform yet.
 - `BrokerOrderType.LIMIT`/`STOP` and `BrokerOrderStatus.PARTIALLY_FILLED` are modelled for future adapters but not usable today - `PaperBroker` only supports `MARKET` orders and never partially fills.
 - No order replace/amend, no short selling, no leverage, no margin - unchanged platform-wide constraints, not new to this milestone.
-- Nothing in `core/broker/` is wired into any Streamlit page or runtime mode yet - this milestone deliberately stops at establishing and testing the abstraction, per its own scope.
+- `IBKRBroker` fetches no live market data: `BrokerPosition.current_price`/`market_value`/`unrealised_pnl` are always `None` when returned by `IBKRBroker` (never fabricated).
+- Nothing in `core/broker/` is wired into any Streamlit page or runtime mode - both `PaperBroker` and `IBKRBroker` remain directly-constructible adapters only, per each milestone's own scope.

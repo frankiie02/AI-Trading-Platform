@@ -94,15 +94,20 @@ class BrokerPosition:
     symbol: str
     quantity: int
     average_entry_price: float
-    current_price: float
+    # current_price/market_value/unrealised_pnl are Optional: PaperBroker
+    # always has a live price, but a read-only broker adapter that does not
+    # fetch market data (e.g. IBKRBroker) may only have average cost - None
+    # here means "not available", never a fabricated number.
+    current_price: Optional[float]
     cost_basis: float
-    market_value: float
-    unrealised_pnl: float
+    market_value: Optional[float]
+    unrealised_pnl: Optional[float]
     realised_pnl: Optional[float]
     side: BrokerOrderSide
     opened_at: Optional[datetime] = None
     strategy_name: Optional[str] = None
     strategy_mode: Optional[str] = None
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass

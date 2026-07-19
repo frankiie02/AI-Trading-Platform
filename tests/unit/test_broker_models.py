@@ -245,6 +245,19 @@ BROKER_PACKAGE_FILES = [
     "core/broker/factory.py",
 ]
 
+# These specific files must remain entirely IBKR/ib_insync-free, proving
+# PaperBroker's isolation from the (now-present) IBKR adapter. factory.py
+# and __init__.py are intentionally excluded here - they legitimately
+# reference IBKRBroker/create_ibkr_broker/ib_insync in prose and imports
+# now that the IBKR milestone exists (covered by test_ibkr_broker.py
+# instead).
+PAPER_ONLY_FILES = [
+    "core/broker/base.py",
+    "core/broker/models.py",
+    "core/broker/errors.py",
+    "core/broker/paper_broker.py",
+]
+
 FORBIDDEN_IMPORT_PREFIXES = (
     "streamlit",
     "pages",
@@ -277,17 +290,28 @@ def test_broker_package_has_no_forbidden_imports(relative_path):
 
 
 @pytest.mark.parametrize("relative_path", BROKER_PACKAGE_FILES)
-def test_broker_package_source_never_mentions_ibkr_or_broker_sdks(relative_path):
+def test_broker_package_source_never_mentions_legacy_execution_or_sql(relative_path):
+    path = Path(__file__).resolve().parents[2] / relative_path
+    source = path.read_text()
+
+    assert "ExecutionRouter" not in source
+    assert "PaperTrader(" not in source
+    assert "sqlite3" not in source
+    assert "cursor.execute(" not in source
+
+
+@pytest.mark.parametrize("relative_path", PAPER_ONLY_FILES)
+def test_paper_only_files_never_mention_ibkr_or_broker_sdks(relative_path):
+    """base.py/models.py/errors.py/paper_broker.py must stay entirely
+    IBKR-free, proving PaperBroker's isolation from the IBKR adapter that
+    now exists alongside it (ibkr_broker.py/ibkr_client.py are covered by
+    test_ibkr_broker.py instead, since referencing ib_insync there is the
+    whole point of those two files)."""
     path = Path(__file__).resolve().parents[2] / relative_path
     source = path.read_text()
 
     assert "ib_insync" not in source
-    assert "ExecutionRouter" not in source
-    assert "PaperTrader(" not in source
     assert "ibapi" not in source
-    assert "import IBKR" not in source
-    assert "sqlite3" not in source
-    assert "cursor.execute(" not in source
 
 
 def test_paper_broker_source_has_no_direct_sql():
