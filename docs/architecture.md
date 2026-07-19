@@ -25,6 +25,7 @@ Market Data → Indicators → Strategy Engine → Regime Engine → Alpha Engin
 - `core/runtime`: minimal application bootstrap and runtime-mode routing (see below).
 - `core/services`: reusable, Streamlit-free orchestration services for dashboard workflows (see below).
 - `core/pipeline`: the shared `TradingPipeline` decision workflow used by `ScannerService`, `BacktestService`, and `PaperTradingService` (and, in a future milestone, `LiveTradingService`) (see below).
+- `core/broker`: the broker-neutral `BrokerInterface` contract and its `PaperBroker` adapter (see below).
 
 ## Runtime Bootstrap
 
@@ -300,3 +301,65 @@ Key points:
 - No benchmark attribution (unlike `BacktestService`'s buy-and-hold comparison).
 - Historical performance metrics (equity curve, drawdown, volatility, Sharpe, Sortino) are only as good as the snapshot history that exists - there is no scheduled/automatic snapshot creation in this milestone, only the explicit page button and (optionally) runtime-triggered reads via `get_summary()`, which does **not** create a snapshot.
 - No live broker portfolio state - `PortfolioService` only ever reads the local paper account.
+
+## Broker Interface
+
+`core/broker/` defines a stable, broker-neutral contract (`BrokerInterface`) and its first concrete adapter, `PaperBroker`, ahead of any real broker integration. The abstraction exists so orchestration code can be written once against `BrokerInterface` and later point at IBKR/Alpaca/OANDA without change:
+
+```text
+TradingPipeline
+      │
+Execution orchestration
+      │
+BrokerInterface
+      │
+      ├── PaperBroker            (implemented)
+      ├── Future IBKRBroker
+      ├── Future AlpacaBroker
+      └── Future OANDABroker
+```
+
+Responsibility boundaries are unchanged and explicit:
+
+```text
+TradingPipeline      -> decisions
+PaperTradingService   -> local paper state and validated mutation
+PortfolioService      -> read-only valuation and analytics
+BrokerInterface        -> broker-facing account/position/order/fill contract
+PaperBroker             -> adapts PaperTradingService/PortfolioService to BrokerInterface
+```
+
+Key points:
+
+- **`BrokerInterface`** (`core/broker/base.py`) is an `ABC` (not `typing.Protocol`): it cannot be instantiated, and any adapter missing a method fails at class-definition time rather than only when a specific call path is exercised. Methods: `broker_name`, `is_connected`, `connect`, `disconnect`, `get_connection_status`, `get_account`, `get_positions`, `get_open_orders`, `get_order`, `submit_order`, `cancel_order`, `get_fills` - no async methods, no streaming/websocket/callback surface.
+- **Broker-neutral models** (`core/broker/models.py`): `BrokerConnection`, `BrokerAccount`, `BrokerPosition`, `BrokerOrderRequest`, `BrokerOrder`, `BrokerFill`, and stable enums `BrokerEnvironment` (PAPER/LIVE/SIMULATION - only PAPER is implemented), `BrokerConnectionState`, `BrokerOrderSide`, `BrokerOrderType` (MARKET/LIMIT/STOP - only MARKET is supported by `PaperBroker`; LIMIT/STOP are modelled for future adapters and rejected with `BrokerUnsupportedOperationError` today), `BrokerTimeInForce` (accepted on a request but not enforced - no order in this system expires on a timer), `BrokerOrderStatus` (`PARTIALLY_FILLED` is modelled for future adapters; `PaperBroker` never produces it, since partial fills are not supported anywhere in this platform). These are entirely independent of `PaperTradingService`'s own `PaperAccount`/`PaperOrder`/`PaperPosition`/`PaperTrade` - `PaperBroker` is the only place that maps between them.
+- **`BrokerOrderRequest.limit_price`** doubles as the required explicit fill-reference price for `MARKET` orders in this simulated environment (there is no real market-data feed to fill against) - `PaperBroker` rejects a `MARKET` order with a missing/non-positive `limit_price` via `BrokerValidationError` rather than fetching a price itself.
+- **Rejection vs. exception rule** (`core/broker/errors.py`, documented in its module docstring): a malformed request (bad symbol/quantity/side/order type, missing the required price) raises `BrokerValidationError`/`BrokerUnsupportedOperationError` *before* `PaperTradingService` is ever called. A syntactically valid order that fails a business rule (insufficient cash, position limits) returns `BrokerOrder(status=REJECTED, rejection_reason=...)`, mirroring `PaperTradingService`'s own existing convention exactly (`InsufficientCashError` is defined there but never raised - the same rejection already comes back as a `REJECTED` order). Infrastructure/persistence failures raise `BrokerError`. Error hierarchy: `BrokerError` → `BrokerConnectionError`, `BrokerValidationError`, `BrokerOrderRejectedError` (reserved for future brokers whose APIs raise on rejection - unused by `PaperBroker`), `BrokerOrderNotFoundError`, `BrokerCancellationError`, `BrokerUnsupportedOperationError`.
+- **`PaperBroker` is an adapter, not a second execution engine** (`core/broker/paper_broker.py`). It owns no persistence and no order-lifecycle logic:
+  ```text
+  submit_order    -> PaperTradingService.create_order_from_decision()
+                      (a minimal TradingDecision is built from the request;
+                      "hold for review" is conveyed via
+                      request.metadata["hold_for_review"] -> auto_fill=False)
+  cancel_order     -> PaperTradingService.cancel_order()      (unmodified)
+  get_account       -> PortfolioService.get_summary()
+  get_positions      -> PortfolioService.get_positions()
+  get_open_orders     -> PaperTradingService.get_open_orders()  (new, thin)
+  get_order            -> PaperTradingService.get_order()          (new, thin)
+  get_fills             -> paper_orders_repository.get_trade_rows() (existing read, unfiltered - "fills" are the raw execution ledger, distinct from PaperTradingService.get_trades()'s completed-round-trip-only view)
+  ```
+  The only two additions to `PaperTradingService` itself are `get_order(order_id) -> Optional[PaperOrder]` and `get_open_orders() -> List[PaperOrder]` (both thin wrappers reusing existing repository reads and the existing `_CANCELLABLE_STATUSES` constant) - the validated order lifecycle, fill/slippage/commission formulas, and cash/position rules are entirely unchanged.
+- **Connection semantics**: `PaperBroker` starts `DISCONNECTED`. `connect()`/`disconnect()` only flip an in-memory flag - no socket, thread, process, or network call is ever made, and connection state is never persisted to the database (verified by a test that reads `account_state` before/after connect/disconnect). Every account/position/order operation raises `BrokerConnectionError` while disconnected. Both `connect()` and `disconnect()` are idempotent. This exists purely for interface parity with brokers that manage a genuine connection; a local paper account has nothing to connect to.
+- **Order status mapping**: `PaperTradingService.OrderStatus.CREATED`/`VALIDATED` → `BrokerOrderStatus.PENDING` (pre-submission internal states, not meaningfully distinct in broker-neutral terms), `SUBMITTED` → `SUBMITTED`, `FILLED`/`REJECTED`/`CANCELLED`/`EXPIRED` map 1:1. No persisted database value was renamed to achieve this - the mapping lives entirely in `PaperBroker._to_broker_order()`.
+- **Cancellation**: delegates directly to `PaperTradingService.cancel_order()`, cancellable only from `{CREATED, VALIDATED, SUBMITTED}` (unchanged). "Release reserved cash" does not apply in this milestone: `PaperTradingService` never holds cash aside before a `FILLED` order debits it (`reserved_cash` is always `0`), so there is nothing to release - documented rather than fabricated. An `ORDER_CANCELLED` audit event is written (reusing the existing audit mechanism); positions and trade history are never touched by cancellation.
+- **Optional factory** (`core/broker/factory.py`): `create_broker(environment, *, paper_service=None, portfolio_service=None)` supports only `BrokerEnvironment.PAPER`; any other environment raises `BrokerUnsupportedOperationError`. No plugin/registry framework.
+- **Legacy `ExecutionRouter`/`PaperTrader`**: `PaperBroker` has zero dependency on either (statically verified by an AST-based test parsing every file in `core/broker/`) - they remain untouched legacy compatibility modules, unchanged from prior milestones.
+- **No broker network dependency**: no `ib_insync`, no IBKR/Alpaca/OANDA SDK, no socket/thread/process is created anywhere in `core/broker/` (statically verified via AST/grep import-boundary tests, and at runtime via a test that monkeypatches `socket.socket` to fail if called across a full connect → submit → cancel → disconnect workflow).
+
+### Known limitations / deferred work
+
+- Only `PaperBroker` exists; `IBKRBroker`/`AlpacaBroker`/`OANDABroker` are not implemented (this milestone establishes and validates the contract first, per its own scope).
+- `BrokerOrderRequest.time_in_force` is accepted but not enforced - no order expires on a timer in this platform yet.
+- `BrokerOrderType.LIMIT`/`STOP` and `BrokerOrderStatus.PARTIALLY_FILLED` are modelled for future adapters but not usable today - `PaperBroker` only supports `MARKET` orders and never partially fills.
+- No order replace/amend, no short selling, no leverage, no margin - unchanged platform-wide constraints, not new to this milestone.
+- Nothing in `core/broker/` is wired into any Streamlit page or runtime mode yet - this milestone deliberately stops at establishing and testing the abstraction, per its own scope.

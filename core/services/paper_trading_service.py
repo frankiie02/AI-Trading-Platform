@@ -352,6 +352,20 @@ class PaperTradingService:
         status_value = status.value if isinstance(status, OrderStatus) else status
         return [self._order_from_row(row) for row in get_order_rows(status_value, self._db_path)]
 
+    def get_order(self, order_id: int) -> Optional[PaperOrder]:
+        """Single-order counterpart to get_orders(); returns None rather
+        than raising when the order does not exist (unlike the private
+        _require_order used internally by the lifecycle methods)."""
+        row = get_order_row(order_id, self._db_path)
+        return self._order_from_row(row) if row is not None else None
+
+    def get_open_orders(self) -> List[PaperOrder]:
+        """Orders still in a cancellable state (CREATED/VALIDATED/SUBMITTED)."""
+        return [
+            order for order in self.get_orders()
+            if OrderStatus(order.status) in _CANCELLABLE_STATUSES
+        ]
+
     def get_trades(self) -> List[PaperTrade]:
         """Completed round-trip trades only (fill rows with an exit_reason);
         entry-only fill rows are excluded since they have no exit yet."""

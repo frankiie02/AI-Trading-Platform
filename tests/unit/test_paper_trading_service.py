@@ -6,7 +6,6 @@ import pytest
 from core.pipeline.models import ScanStrategyMode, TradingDecision
 from core.services.paper_trading_service import (
     ExitReason,
-    InsufficientCashError,
     InvalidOrderStateTransitionError,
     InvalidPaperOrderError,
     OrderStatus,
@@ -206,6 +205,49 @@ def test_invalid_order_state_transitions(db_path, setup, action):
             service.cancel_order(order.order_id)
         elif action == "submit":
             service.submit_order(order.order_id)
+
+
+def test_get_order_returns_matching_order(db_path):
+    service = make_service(db_path)
+    created = service.create_order_from_decision(make_decision())
+
+    fetched = service.get_order(created.order_id)
+
+    assert fetched is not None
+    assert fetched.order_id == created.order_id
+    assert fetched.status == OrderStatus.FILLED.value
+
+
+def test_get_order_returns_none_for_missing_order(db_path):
+    service = make_service(db_path)
+
+    assert service.get_order(999999) is None
+
+
+def test_get_open_orders_excludes_terminal_orders(db_path):
+    service = make_service(db_path, max_open_positions=5)
+
+    held = service.create_order_from_decision(
+        make_decision(symbol="AAPL"), auto_fill=False
+    )
+    filled = service.create_order_from_decision(make_decision(symbol="MSFT"))
+    rejected = service.create_order_from_decision(
+        make_decision(symbol="TSLA", suggested_shares=0)
+    )
+
+    open_orders = service.get_open_orders()
+    open_ids = {order.order_id for order in open_orders}
+
+    assert held.order_id in open_ids
+    assert filled.order_id not in open_ids
+    assert rejected.order_id not in open_ids
+
+
+def test_get_open_orders_empty_when_none_pending(db_path):
+    service = make_service(db_path)
+    service.create_order_from_decision(make_decision())
+
+    assert service.get_open_orders() == []
 
 
 # ----------------------------------------------------------------------
@@ -444,7 +486,6 @@ def test_reconciliation_success(db_path):
 
 
 def test_reconciliation_mismatch(db_path):
-    import core.execution.paper_orders_repository as repository
     from core.database.database import get_connection
 
     service = make_service(db_path)
